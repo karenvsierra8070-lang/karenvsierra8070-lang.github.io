@@ -750,10 +750,10 @@
             let baseMinutes = 60;
             let minPerStep = 15, maxPerStep = 45;
             const typeConfig = {
-                'Tarea': { min: 15, max: 45 }, 'Proyecto': { min: 25, max: 60 }, 'Ensayo': { min: 30, max: 120 },
-                'Presentación': { min: 30, max: 120 }, 'Laboratorio': { min: 25, max: 60 }, 'Lectura': { min: 15, max: 60 },
-                'Investigación': { min: 30, max: 120 }, 'Estudio': { min: 15, max: 45 }, 'Ejercicios': { min: 3, max: 40 },
-                'Hacer video': { min: 60, max: 180 }, 'Apuntes': { min: 20, max: 60 }, 'Preparación exposicion': { min: 30, max: 90 },
+                'Tarea': { min: 15, max: 80 }, 'Proyecto': { min: 25, max: 160 }, 'Ensayo': { min: 30, max: 180 },
+                'Presentación': { min: 30, max: 120 }, 'Laboratorio': { min: 25, max: 60 }, 'Lectura': { min: 30, max: 90 },
+                'Investigación': { min: 30, max: 120 }, 'Estudio': { min: 20, max: 45 }, 'Ejercicios': { min: 10, max: 40 },
+                'Hacer video': { min: 60, max: 180 }, 'Apuntes': { min: 30, max: 80 }, 'Preparación exposicion': { min: 30, max: 90 },
                 'Curso': { min: 60, max: 180 }
             };
             if (typeConfig[task.type]) { minPerStep = typeConfig[task.type].min; maxPerStep = typeConfig[task.type].max; }
@@ -773,7 +773,7 @@
             // 1. Regla de Sueño (22:00 a 7:00) - Solo se ignora si es urgente y se lo permitimos
             if (!ignoreSleep) {
                 // No puede iniciar ni finalizar en este rango
-                if (startMins >= 22*60 || startMins < 7*60 || endMins >= 22*60 || endMins < 7*60) return false;
+                if (startMins >= 22*60 || startMins < 8*60 || endMins >= 22*60 || endMins < 8*60) return false;
             }
             
             // 2. Clases (Sumando 1 hora de transporte antes y después)
@@ -879,7 +879,7 @@
             if (foundSlot) {
                 let alert = null;
                 if (isEmergencyOverride) {
-                    alert = "⚠️ Modo Emergencia: Se asignó en horario de sueño (22:00-07:00) porque la tarea es urgente y no hay otros cupos.";
+                    alert = "⚠️ Modo Emergencia: Se asignó en horario de sueño (22:00-08:00) porque la tarea es urgente y no hay otros cupos.";
                 }
                 return { start: foundSlot.start, end: foundSlot.end, duration: duration, limitUsed: limitOffset, alert: alert };
             } else {
