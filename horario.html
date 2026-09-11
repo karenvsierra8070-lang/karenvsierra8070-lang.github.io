@@ -914,6 +914,27 @@
         const $ = (id) => document.getElementById(id);
         const createEl = (tag, cls) => { const el = document.createElement(tag); if(cls) el.className = cls; return el; };
 
+        // ==========================================================
+        // FIX ZONA HORARIA (causa del "examen del lunes aparece en
+        // domingo"): el código antiguo etiquetaba cada columna del
+        // horario con dayDate.toISOString(), que convierte a UTC.
+        // Las columnas heredaban la hora del momento (ej: 8pm), y
+        // al sumar las 5 horas de diferencia (UTC-5) cruzaban al
+        // día siguiente: la columna del domingo quedaba etiquetada
+        // como "lunes", y el examen del lunes se pintaba alli.
+        // Las tareas NO usaban esa etiqueta (comparaban con
+        // isSameDay en hora local), por eso siempre cayeron bien.
+        // dateToStr/strToDate operan 100% en hora local.
+        // ==========================================================
+        function dateToStr(d) {
+            return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+        }
+
+        function strToDate(dateStr) {
+            const [y, m, d] = dateStr.split('-').map(Number);
+            return new Date(y, m - 1, d, 12, 0, 0); // mediodia local = sin desfases
+        }
+
         // --- 1. AUTENTICACIÓN Y SINCRONIZACIÓN ---
         onAuthStateChanged(auth, user => {
             if (user) {
@@ -1041,7 +1062,8 @@
 
             for(let i=0; i<7; i++) {
                 const dayDate = new Date(startOfWeek); dayDate.setDate(dayDate.getDate() + i);
-                const dateStr = dayDate.toISOString().split('T')[0];
+                // FIX: fecha local en vez de toISOString (UTC)
+                const dateStr = dateToStr(dayDate);
                 
                 html += `<div class="day-col" data-date="${dateStr}">`;
                 
@@ -1067,7 +1089,8 @@
 
         function generateEventBlocks(dayDate) {
             let html = '';
-            const dateStr = dayDate.toISOString().split('T')[0];
+            // FIX: fecha local en vez de toISOString (UTC)
+            const dateStr = dateToStr(dayDate);
             const dayLetter = ['D', 'L', 'M', 'X', 'J', 'V', 'S'][dayDate.getDay()];
             const now = new Date();
             const limitFocus = new Date(now.getTime() + 12 * 60 * 60 * 1000);
@@ -1180,7 +1203,8 @@
             if(oldLine) oldLine.remove();
 
             const now = new Date();
-            const todayStr = now.toISOString().split('T')[0];
+            // FIX: fecha local en vez de toISOString (UTC)
+            const todayStr = dateToStr(now);
             const todayCol = document.querySelector(`.day-col[data-date="${todayStr}"]`);
             
             if(todayCol) {
@@ -1216,7 +1240,8 @@
 
             for(let d=1; d<=lastDay.getDate(); d++) {
                 const date = new Date(year, month, d);
-                const dateStr = date.toISOString().split('T')[0];
+                // FIX: fecha local en vez de toISOString (UTC)
+                const dateStr = dateToStr(date);
                 const isToday = d === today.getDate() && month === today.getMonth() && year === today.getFullYear();
                 
                 const density = calculateDayLoad(dateStr);
@@ -1244,7 +1269,8 @@
             let dots = '';
             Object.values(appData.tasks).forEach(t => {
                 if(t.completed || !t.recommendedStart) return;
-                if(new Date(t.recommendedStart).toISOString().split('T')[0] === dateStr) {
+                // FIX: comparar en fecha local, no UTC
+                if(dateToStr(new Date(t.recommendedStart)) === dateStr) {
                     const c = (appData.subjects[t.subjectId] || {}).color || '#888';
                     dots += `<span class="dot" style="background:${c}"></span>`;
                 }
@@ -1268,7 +1294,8 @@
             let totalHours = 0;
             Object.values(appData.tasks).forEach(t => {
                 if(t.completed || !t.recommendedStart) return;
-                if(new Date(t.recommendedStart).toISOString().split('T')[0] === dateStr) {
+                // FIX: comparar en fecha local, no UTC
+                if(dateToStr(new Date(t.recommendedStart)) === dateStr) {
                     totalHours += (t.duration || 60) / 60;
                 }
             });
@@ -1441,7 +1468,8 @@
                         if(slotMins >= (sMins - 60) && slotMins < (eMins + 60)) isBusy = true;
                     }
 
-                    const dateStrCheck = currentScan.toISOString().split('T')[0];
+                    // FIX: fecha local en vez de toISOString (UTC)
+                    const dateStrCheck = dateToStr(currentScan);
                     if(appData.studyBlocks) {
                         Object.values(appData.studyBlocks).forEach(b => {
                             if(b.date === dateStrCheck) {
@@ -1477,6 +1505,10 @@
                     const slot = distributedSlots[i];
                     const taskEnd = new Date(slot.start.getTime() + (task.duration || 60) * 60000);
                     
+                    // NOTA: aqui SI se mantiene toISOString a proposito:
+                    // guarda fecha+hora completa, y tareas.html/horario la
+                    // leen correctamente con new Date() (incluye la hora,
+                    // por eso las tareas nunca sufrian el desfase).
                     updates[`tasks/${currentUser.uid}/${task.id}/recommendedStart`] = slot.start.toISOString();
                     updates[`tasks/${currentUser.uid}/${task.id}/recommendedEnd`] = taskEnd.toISOString();
                 }
@@ -1491,6 +1523,10 @@
         function isSameDay(d1, d2) { return d1.getFullYear() === d2.getFullYear() && d1.getMonth() === d2.getMonth() && d1.getDate() === d2.getDate(); }
         function getStartOfWeek(d) {
             const date = new Date(d);
+            // FIX: normalizar a medianoche. Antes las columnas heredaban
+            // la hora del momento (ej: 8pm) y eso, combinado con
+            // toISOString, corria las etiquetas de fecha al dia siguiente.
+            date.setHours(0, 0, 0, 0);
             const day = date.getDay();
             const diff = date.getDate() - day + (day === 0 ? -6 : 1);
             return new Date(date.setDate(diff));
@@ -1542,23 +1578,24 @@
 
         // Examenes Sidebar
         function renderExamList() {
-            const now = new Date();
+            // FIX: comparar con fecha local (antes new Date('YYYY-MM-DD')
+            // se interpretaba como UTC y corria/ocultaba examenes)
+            const today = new Date(); today.setHours(0,0,0,0);
             const list = Object.entries(appData.exams || {})
                 .map(([id, e]) => ({id, ...e}))
                 .filter(e => {
                     // Si está completado, no mostrar
                     if(e.completed) return false;
                     // Si ya pasó la fecha, no mostrar
-                    return new Date(e.date) >= now.setHours(0,0,0,0);
+                    return strToDate(e.date) >= today;
                 })
-                .sort((a,b) => new Date(a.date) - new Date(b.date))
+                .sort((a,b) => strToDate(a.date) - strToDate(b.date))
                 .slice(0, 5);
 
             $('examListContainer').innerHTML = list.map(e => {
                 const subj = appData.subjects[e.subjectId] || {name: 'General', color: '#e74c3c', icon: '📝'};
-                const examDate = new Date(e.date);
-                const diffTime = examDate - new Date();
-                const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+                const examDate = strToDate(e.date);
+                const diffDays = Math.round((examDate - today) / (1000 * 60 * 60 * 24));
                 
                 return `
                 <div class="exam-item" style="border-left-color: ${subj.color}" onclick="openDetailPanel('exam', '${e.id}')">
