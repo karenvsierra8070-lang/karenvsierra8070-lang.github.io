@@ -1,5 +1,3 @@
-
-
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -20,8 +18,6 @@
   });
 </script>
 <!-- === FIN ONE SIGNAL PUSH === -->
-    </script>
-    <!-- === FIN ONE SIGNAL PUSH === -->
     <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700&family=Poppins:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
@@ -590,7 +586,10 @@
         const db = getDatabase(app);
 
         let uid = null;
-        let DB = { tasks: {}, subjects: {}, settings: {}, classSchedule: {}, workSchedule: {} };
+        // FIX: agregamos exams y studyBlocks. Antes no existian en la
+        // memoria local, por eso el motor de recomendacion podia
+        // sugerir tareas encima de un examen o de sus bloques de estudio.
+        let DB = { tasks: {}, subjects: {}, settings: {}, classSchedule: {}, workSchedule: {}, exams: {}, studyBlocks: {} };
         let tempTaskData = null;
         
         // Pomodoro State
@@ -615,6 +614,8 @@
                 listen('subjects');
                 listen('classSchedule');
                 listen('workSchedule');
+                listen('exams');        // NUEVO: para no recomendar sobre exámenes
+                listen('studyBlocks');  // NUEVO: para no recomendar sobre bloques de estudio
                 onValue(ref(db, `users/${uid}`), snap => {
                     if(snap.exists()) DB.settings = snap.val();
                     renderSidebarSubjects();
@@ -623,7 +624,7 @@
             } else { window.location.href = 'index.html'; }
         });
 
-              function listen(path) {
+        function listen(path) {
             onValue(ref(db, `${path}/${uid}`), snap => {
                 DB[path] = snap.val() || {};
                 if(path === 'subjects') { populateSubjects(); renderSidebarSubjects(); }
@@ -764,7 +765,9 @@
             if (task.difficulty === 'media') baseMinutes *= 1.3;
             if (task.difficulty === 'alta') baseMinutes *= 1.6;
             return Math.round(baseMinutes);
-        }        function isTimeSlotValid(start, end, ignoreSleep = false) {
+        }
+
+        function isTimeSlotValid(start, end, ignoreSleep = false) {
             const startMins = start.getHours() * 60 + start.getMinutes();
             const endMins = end.getHours() * 60 + end.getMinutes();
             const dayMap = ['D', 'L', 'M', 'X', 'J', 'V', 'S'];
@@ -811,6 +814,47 @@
                     if (startTS < tEnd && endTS > tStart) return false;
                 }
             }
+
+            // 5. NUEVO: Exámenes de ese día (la tarea no puede pisar el examen).
+            // FIX zona horaria: fecha construida en hora LOCAL (no toISOString),
+            // para no heredar el bug de desfase de un día que tuvimos antes.
+            const slotDateStr = `${start.getFullYear()}-${String(start.getMonth() + 1).padStart(2, '0')}-${String(start.getDate()).padStart(2, '0')}`;
+
+            if (DB.exams) {
+                for (let examId in DB.exams) {
+                    const e = DB.exams[examId];
+                    if (!e || e.completed) continue;
+                    if (e.date !== slotDateStr || !e.time) continue;
+
+                    const examStart = new Date(e.date + 'T' + e.time); // hora local
+                    const examEnd = new Date(examStart.getTime() + (e.duration || 120) * 60000);
+                    // Margen de 30 min antes del examen para llegar con calma.
+                    // Si no lo quieres, cambia "- 30 * 60000" por "- 0":
+                    const examStartWithMargin = new Date(examStart.getTime() - 30 * 60000);
+
+                    // ¿Se solapan el slot de la tarea y el examen?
+                    if (startTS < examEnd.getTime() && endTS > examStartWithMargin.getTime()) return false;
+                }
+            }
+
+            // 6. NUEVO: Bloques de estudio generados para los exámenes
+            if (DB.studyBlocks) {
+                for (let blockId in DB.studyBlocks) {
+                    const b = DB.studyBlocks[blockId];
+                    if (!b || b.date !== slotDateStr || !b.startHour || !b.endHour) continue;
+
+                    // Si el examen padre ya está completado, su bloque se ignora
+                    const parent = DB.exams && DB.exams[b.examId];
+                    if (parent && parent.completed) continue;
+
+                    const bStart = new Date(b.date + 'T' + b.startHour).getTime();
+                    const bEnd = new Date(b.date + 'T' + b.endHour).getTime();
+
+                    // ¿Se solapan el slot de la tarea y el bloque de estudio?
+                    if (startTS < bEnd && endTS > bStart) return false;
+                }
+            }
+
             return true;
         }
         
@@ -929,7 +973,7 @@
 
         window.recalculate = () => performCalculation();
 
-             window.confirmSave = async () => {
+        window.confirmSave = async () => {
             if(tempTaskData.mode === 'grupo') {
                 const manualStart = new Date($('manualStartDate').value + 'T' + $('manualStartTime').value);
                 tempTaskData.recommendedStart = manualStart.toISOString();
@@ -993,7 +1037,9 @@
                 // MODIFICACIÓN: Ocultar tareas completadas
                 if(t.completed) return false;
 
-                const due = new Date(t.dueDate);
+                // FIX UTC: antes era new Date(t.dueDate) (medianoche UTC = día
+                // anterior 7pm en Colombia) y desfasaba el filtro de tiempo.
+                const due = new Date(t.dueDate + 'T12:00:00');
                 const diffDays = Math.ceil((due - now) / (1000*60*60*24));
                 if(timeF === '3days' && diffDays > 3) return false;
                 if(timeF === 'week' && diffDays > 7) return false;
@@ -1204,83 +1250,84 @@
             $('pomoCycleInfo').innerText = `Ciclo ${pomoState.currentCycle + 1} de ${pomoState.cycles} - ${statusText}`;
             $('pomoClock').style.color = pomoState.isBreak ? 'var(--success)' : 'var(--primary)';
         }
-// --- 11. NOTIFICACIONES PUSH ---
-let lastChecked = new Set();
 
-async function programarNotificacionesPush(task) {
-    // Esta función ya no necesita enviar a Pipedream, el reloj se encarga.
-    // Solo la llamamos en confirmSave para mantener tu flujo, pero el reloj hace el trabajo real.
-    iniciarRelojNotificaciones();
-}
+        // --- 11. NOTIFICACIONES PUSH ---
+        let lastChecked = new Set();
 
-function iniciarRelojNotificaciones() {
-    if (window._relojNotifsActivo) return; // Evitar crear múltiples relojes
-    window._relojNotifsActivo = true;
-    verificarTareas(); // Verificar inmediato
-    setInterval(verificarTareas, 30000); // Verificar cada 30 segundos
-}
+        async function programarNotificacionesPush(task) {
+            // Esta función ya no necesita enviar a Pipedream, el reloj se encarga.
+            // Solo la llamamos en confirmSave para mantener tu flujo, pero el reloj hace el trabajo real.
+            iniciarRelojNotificaciones();
+        }
 
-async function verificarTareas() {
-    const tasks = DB.tasks || {};
-    const now = new Date();
+        function iniciarRelojNotificaciones() {
+            if (window._relojNotifsActivo) return; // Evitar crear múltiples relojes
+            window._relojNotifsActivo = true;
+            verificarTareas(); // Verificar inmediato
+            setInterval(verificarTareas, 30000); // Verificar cada 30 segundos
+        }
 
-    for (const [id, task] of Object.entries(tasks)) {
-        if (task.completed) continue;
+        async function verificarTareas() {
+            const tasks = DB.tasks || {};
+            const now = new Date();
 
-        // TIPO 1: 10 minutos antes de EMPEZAR
-        if (task.recommendedStart) {
-            const inicio = new Date(task.recommendedStart);
-            const diezMinAntes = new Date(inicio.getTime() - 10 * 60000);
-            
-            if (now >= diezMinAntes && now < inicio) {
-                const key = `10m_${id}`;
-                if (!lastChecked.has(key)) {
-                    lastChecked.add(key);
-                    await enviarNotificacionNativa("⏰ Thynka: Es hora de empezar", `Empieza ahora: "${task.title}"`);
+            for (const [id, task] of Object.entries(tasks)) {
+                if (task.completed) continue;
+
+                // TIPO 1: 10 minutos antes de EMPEZAR
+                if (task.recommendedStart) {
+                    const inicio = new Date(task.recommendedStart);
+                    const diezMinAntes = new Date(inicio.getTime() - 10 * 60000);
+                    
+                    if (now >= diezMinAntes && now < inicio) {
+                        const key = `10m_${id}`;
+                        if (!lastChecked.has(key)) {
+                            lastChecked.add(key);
+                            await enviarNotificacionNativa("⏰ Thynka: Es hora de empezar", `Empieza ahora: "${task.title}"`);
+                        }
+                    }
+                }
+
+                // TIPO 3: URGENTE - Prioridad alta + vence en 3 horas
+                if ((task.priority === 'alta' || task.difficulty === 'alta') && task.dueDate) {
+                    const vencimiento = new Date(task.dueDate + 'T' + (task.dueTime || '23:59'));
+                    const tresHorasAntes = new Date(vencimiento.getTime() - 3 * 3600000);
+                    
+                    if (now >= tresHorasAntes && now < new Date(tresHorasAntes.getTime() + 60000)) {
+                        const key = `3h_${id}`;
+                        if (!lastChecked.has(key)) {
+                            lastChecked.add(key);
+                            await enviarNotificacionNativa("🚨 Thynka: ¡Urgente!", `"${task.title}" vence en 3 horas.`);
+                        }
+                    }
+                }
+
+                // TIPO 2: Próximos a vencer en 3 días
+                if (task.dueDate) {
+                    const vencimiento = new Date(task.dueDate + 'T' + (task.dueTime || '23:59'));
+                    const tresDiasAntes = new Date(vencimiento.getTime() - 3 * 86400000);
+                    
+                    if (now >= tresDiasAntes && now < new Date(tresDiasAntes.getTime() + 60000)) {
+                        const key = `3d_${id}`;
+                        if (!lastChecked.has(key)) {
+                            lastChecked.add(key);
+                            await enviarNotificacionNativa("📅 Thynka: Tarea próxima", `"${task.title}" vence en 3 días.`);
+                        }
+                    }
                 }
             }
         }
 
-        // TIPO 3: URGENTE - Prioridad alta + vence en 3 horas
-        if ((task.priority === 'alta' || task.difficulty === 'alta') && task.dueDate) {
-            const vencimiento = new Date(task.dueDate + 'T' + (task.dueTime || '23:59'));
-            const tresHorasAntes = new Date(vencimiento.getTime() - 3 * 3600000);
-            
-            if (now >= tresHorasAntes && now < new Date(tresHorasAntes.getTime() + 60000)) {
-                const key = `3h_${id}`;
-                if (!lastChecked.has(key)) {
-                    lastChecked.add(key);
-                    await enviarNotificacionNativa("🚨 Thynka: ¡Urgente!", `"${task.title}" vence en 3 horas.`);
-                }
+        async function enviarNotificacionNativa(title, body) {
+            if ('Notification' in window && Notification.permission === 'granted') {
+                try {
+                    new Notification(title, { body: body, requireInteraction: true });
+                } catch(e) {}
+            }
+            if ('Notification' in window && Notification.permission === 'default') {
+                Notification.requestPermission();
             }
         }
-
-        // TIPO 2: Próximos a vencer en 3 días
-        if (task.dueDate) {
-            const vencimiento = new Date(task.dueDate + 'T' + (task.dueTime || '23:59'));
-            const tresDiasAntes = new Date(vencimiento.getTime() - 3 * 86400000);
-            
-            if (now >= tresDiasAntes && now < new Date(tresDiasAntes.getTime() + 60000)) {
-                const key = `3d_${id}`;
-                if (!lastChecked.has(key)) {
-                    lastChecked.add(key);
-                    await enviarNotificacionNativa("📅 Thynka: Tarea próxima", `"${task.title}" vence en 3 días.`);
-                }
-            }
-        }
-    }
-}
-
-async function enviarNotificacionNativa(title, body) {
-    if ('Notification' in window && Notification.permission === 'granted') {
-        try {
- new Notification(title, { body: body, requireInteraction: true });
-        } catch(e) {}
-    }
-    if ('Notification' in window && Notification.permission === 'default') {
-        Notification.requestPermission();
-    }
-}
     </script>
 </body>
 </html>
