@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -627,6 +626,9 @@
             background: var(--bg-primary);
             border-radius: 10px;
             border-left: 3px solid var(--primary);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
         }
 
         .note-item h5 {
@@ -644,8 +646,19 @@
             font-size: 1.1rem;
             font-weight: 700;
             color: var(--primary);
-            float: right;
         }
+
+        .delete-note {
+            background: transparent;
+            border: none;
+            color: var(--text-muted);
+            cursor: pointer;
+            padding: 4px;
+            border-radius: 6px;
+            transition: all var(--transition-fast);
+        }
+
+        .delete-note:hover { color: var(--danger); background: var(--danger-light); }
 
         /* Bloques de Estudio */
         .study-blocks-section {
@@ -897,10 +910,10 @@
 
                 <!-- Tabs -->
                 <div class="tabs">
-                    <button class="tab-btn active" onclick="filterExams('all')">Todos</button>
-                    <button class="tab-btn" onclick="filterExams('pending')">Pendientes</button>
-                    <button class="tab-btn" onclick="filterExams('completed')">Completados</button>
-                    <button class="tab-btn" onclick="filterExams('important')">Importantes</button>
+                    <button class="tab-btn active" id="tab-all" onclick="filterExams('all')">Todos</button>
+                    <button class="tab-btn" id="tab-pending" onclick="filterExams('pending')">Pendientes</button>
+                    <button class="tab-btn" id="tab-completed" onclick="filterExams('completed')">Completados</button>
+                    <button class="tab-btn" id="tab-important" onclick="filterExams('important')">Importantes</button>
                 </div>
 
                 <!-- Lista de Examenes -->
@@ -1107,7 +1120,9 @@
 
         const $ = (id) => document.getElementById(id);
 
-        // Autenticacion
+        // ==========================================================
+        // AUTENTICACION
+        // ==========================================================
         onAuthStateChanged(auth, user => {
             if (user) {
                 currentUser = user;
@@ -1157,7 +1172,9 @@
             });
         }
 
-        // UI Controls
+        // ==========================================================
+        // UI CONTROLS
+        // ==========================================================
         $('btnTheme').onclick = () => {
             const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
             document.documentElement.setAttribute('data-theme', isDark ? 'light' : 'dark');
@@ -1176,7 +1193,244 @@
             $('overlayPanel').classList.remove('active');
         };
 
+        window.signOut = () => auth.signOut();
+
+        // ==========================================================
+        // UTILIDADES DE FECHA
+        // FIX: usar siempre hora LOCAL. new Date('2025-08-12') se
+        // interpreta como UTC y desfasa el dia en zonas como
+        // Colombia (UTC-5). Estas funciones lo evitan.
+        // ==========================================================
+        function dateToStr(d) {
+            return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+        }
+
+        function strToDate(dateStr) {
+            const [y, m, d] = dateStr.split('-').map(Number);
+            return new Date(y, m - 1, d, 12, 0, 0); // mediodia local = sin desfases
+        }
+
+        function timeToMins(t) {
+            if (!t) return null;
+            const [h, m] = t.split(':').map(Number);
+            return h * 60 + (m || 0);
+        }
+
+        function minsToTime(m) {
+            return `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
+        }
+
+        const DAY_LETTERS = ['D', 'L', 'M', 'X', 'J', 'V', 'S'];
+
+        // ==========================================================
+        // FIX #3: FECHAS DE LOS BLOQUES
+        // Empieza el dia ANTERIOR al examen y retrocede con saltos
+        // crecientes (2, 3, 4, 5...). Verificado con tus ejemplos:
+        //  - Examen 12 ago (hoy 8)  -> 11, 9
+        //  - Examen 20 ago (hoy 8)  -> 19, 17, 14, 10
+        // ==========================================================
+        function getBlockDates(examDateStr, maxBlocks = 6) {
+            const today = new Date();
+            today.setHours(0, 0, 0, 0);
+            const exam = strToDate(examDateStr);
+            const totalDays = Math.round((exam - today) / 86400000);
+
+            if (totalDays < 1) return []; // examen hoy o pasado -> sin bloques
+
+            const dates = [];
+            const cursor = new Date(exam);
+            cursor.setDate(cursor.getDate() - 1); // dia anterior al examen
+            let gap = 2;
+
+            while (dates.length < maxBlocks && cursor >= today) {
+                dates.push(dateToStr(cursor));
+                cursor.setDate(cursor.getDate() - gap);
+                gap++;
+            }
+            return dates;
+        }
+
+        // ==========================================================
+        // MOTOR INTELIGENTE DE BLOQUES
+        // ==========================================================
+        async function generateSmartStudyBlocks(examId, exam) {
+            const dates = getBlockDates(exam.date);
+            if (dates.length === 0) return 0;
+
+            const usedStarts = new Set(); // FIX #1: no repetir la misma hora
+            const localBlocks = [];       // bloques recien creados en esta pasada
+            let created = 0;
+
+            for (const dateStr of dates) {
+                const slot = findBestSlot(dateStr, examId, usedStarts, localBlocks);
+                if (!slot) continue; // dia lleno -> se omite (equivale a "1 dia mas")
+
+                const blockData = {
+                    examId: examId,
+                    examTitle: exam.title,
+                    subjectId: exam.subjectId,
+                    date: dateStr,
+                    startHour: slot.start,
+                    endHour: slot.end,
+                    duration: 120
+                };
+
+                await push(ref(db, `studyBlocks/${currentUser.uid}`), blockData);
+                localBlocks.push(blockData);
+                usedStarts.add(slot.start);
+                created++;
+            }
+            return created;
+        }
+
+        // ==========================================================
+        // FIX #1 y #2: Busca un hueco REALMENTE libre y varia la hora
+        // Lee los datos EXACTAMENTE como los lee horario.html
+        // ==========================================================
+        function findBestSlot(dateStr, currentExamId, usedStarts, localBlocks) {
+            const DURATION = 120;       // bloques de 2 horas
+            const DAY_START = 8 * 60;   // 08:00
+            const DAY_END   = 17 * 60;  // 17:00
+
+            const busy = [];
+            const addRange = (s, e) => {
+                if (s === null || s === undefined || e === null || e === undefined) return;
+                if (e > s) busy.push([s, e]);
+            };
+
+            // Almuerzo 12:00 - 13:00
+            addRange(12 * 60, 13 * 60);
+
+            const dayLetter = DAY_LETTERS[strToDate(dateStr).getDay()];
+
+            // Clases de ese dia (misma estructura que horario.html)
+            const c = (appData.classSchedule || {})[dayLetter];
+            if (c && c.start && c.end) addRange(timeToMins(c.start), timeToMins(c.end));
+
+            // Trabajo de ese dia (solo si el usuario trabaja, igual que horario.html)
+            if ((appData.settings || {}).works === 'si') {
+                const w = (appData.workSchedule || {})[dayLetter];
+                if (w && w.start && w.end) addRange(timeToMins(w.start), timeToMins(w.end));
+            }
+
+            // Tareas de ese dia (formato de horario.html: recommendedStart ISO + duration)
+            Object.values(appData.tasks || {}).forEach(t => {
+                if (!t || t.completed || !t.recommendedStart) return;
+                const td = new Date(t.recommendedStart);
+                if (dateToStr(td) !== dateStr) return;
+                const s = td.getHours() * 60 + td.getMinutes();
+                const dur = t.duration || 60;
+                addRange(s, s + dur);
+            });
+
+            // Otros bloques de estudio ya guardados en Firebase
+            Object.values(appData.studyBlocks || {}).forEach(b => {
+                if (b.date === dateStr && b.startHour && b.endHour) {
+                    addRange(timeToMins(b.startHour), timeToMins(b.endHour));
+                }
+            });
+
+            // Bloques creados en esta misma generacion
+            (localBlocks || []).forEach(b => {
+                if (b.date === dateStr) addRange(timeToMins(b.startHour), timeToMins(b.endHour));
+            });
+
+            // FIX: No chocar con OTROS examenes registrados ese dia
+            // (ni con el mismo examen si se cambia la hora)
+            Object.entries(appData.exams || {}).forEach(([id, e]) => {
+                if (id === currentExamId) return;
+                if (e.completed) return;
+                if (e.date === dateStr && e.time) {
+                    const s = timeToMins(e.time);
+                    const dur = e.duration || 120;
+                    addRange(s - 30, s + dur); // media hora antes tambien
+                }
+            });
+
+            // Calcular huecos libres dentro de la ventana 8:00 - 17:00
+            busy.sort((a, b) => a[0] - b[0]);
+            const free = [];
+            let cursor = DAY_START;
+            for (const [s, e] of busy) {
+                if (s > cursor) free.push([cursor, Math.min(s, DAY_END)]);
+                cursor = Math.max(cursor, e);
+                if (cursor >= DAY_END) break;
+            }
+            if (cursor < DAY_END) free.push([cursor, DAY_END]);
+
+            // Todas las horas de inicio posibles (cada 30 min)
+            let candidates = [];
+            free.forEach(([ws, we]) => {
+                for (let s = ws; s + DURATION <= we; s += 30) candidates.push(s);
+            });
+            if (candidates.length === 0) return null;
+
+            // Si el bloque es para HOY, solo horas futuras
+            const now = new Date();
+            if (dateStr === dateToStr(now)) {
+                const nowMins = now.getHours() * 60 + now.getMinutes() + 30;
+                candidates = candidates.filter(s => s >= nowMins);
+                if (candidates.length === 0) return null;
+            }
+
+            // FIX #1: descartar horas ya usadas en otros bloques y
+            // elegir AL AZAR (rompe el patron repetitivo)
+            let pool = candidates.filter(s => !usedStarts.has(s));
+            if (pool.length === 0) pool = candidates;
+
+            const start = pool[Math.floor(Math.random() * pool.length)];
+            return { start: minsToTime(start), end: minsToTime(start + DURATION) };
+        }
+
+        // ==========================================================
+        // Limpia los bloques de un examen (lee directo de Firebase)
+        // ==========================================================
+        async function clearBlocksForExam(examId) {
+            const snapshot = await get(ref(db, `studyBlocks/${currentUser.uid}`));
+            const blocks = snapshot.val() || {};
+            
+            const updates = {};
+            let count = 0;
+            
+            for (const [id, block] of Object.entries(blocks)) {
+                if (block.examId === examId) {
+                    updates[`studyBlocks/${currentUser.uid}/${id}`] = null;
+                    count++;
+                }
+            }
+            
+            if (Object.keys(updates).length > 0) {
+                await update(ref(db), updates);
+            }
+        }
+
+        // ==========================================================
+        // Boton "Regenerar": regenera bloques de TODOS los examenes
+        // importantes pendientes
+        // ==========================================================
+        window.generateStudyBlocks = async function() {
+            if (!currentUser) return;
+            const today = new Date(); today.setHours(0, 0, 0, 0);
+
+            const pending = Object.entries(appData.exams)
+                .filter(([, e]) => e.important && !e.completed && strToDate(e.date) >= today);
+
+            if (pending.length === 0) {
+                alert('No hay examenes importantes pendientes para generar bloques.');
+                return;
+            }
+            if (!confirm(`Se regeneraran los bloques de ${pending.length} examen(es). ¿Continuar?`)) return;
+
+            for (const [id, exam] of pending) {
+                await clearBlocksForExam(id);
+                await generateSmartStudyBlocks(id, exam);
+            }
+            alert('¡Bloques regenerados correctamente!');
+        };
+
+        // ==========================================================
         // Funciones de Examen
+        // ==========================================================
         window.openExamModal = function(examId = null) {
             editingExamId = examId;
             populateSubjectDropdowns();
@@ -1198,6 +1452,7 @@
                 $('examModalTitle').textContent = 'Registrar Examen';
                 $('inputExamTitle').value = '';
                 $('inputExamDate').value = '';
+                $('inputExamTime').value = '09:00';
                 $('inputExamDesc').value = '';
                 $('inputExamWeight').value = '';
                 $('inputExamDuration').value = '';
@@ -1240,8 +1495,8 @@
                 weight,
                 duration,
                 important,
-                completed: false,
-                createdAt: Date.now()
+                completed: editingExamId ? (appData.exams[editingExamId]?.completed || false) : false,
+                createdAt: editingExamId ? (appData.exams[editingExamId]?.createdAt || Date.now()) : Date.now()
             };
 
             try {
@@ -1254,9 +1509,12 @@
                     savedExamId = newRef.key;
                 }
 
-                if (important && savedExamId) {
+                // Limpiar bloques viejos siempre, y regenerar solo si es importante
+                if (savedExamId) {
                     await clearBlocksForExam(savedExamId);
-                    await generateSmartStudyBlocks(savedExamId, examData);
+                    if (important) {
+                        await generateSmartStudyBlocks(savedExamId, examData);
+                    }
                 }
 
                 closeExamModal();
@@ -1268,19 +1526,14 @@
                 alert('Error al guardar el examen: ' + error.message);
             }
         };
-        
-        // --- ELIMINAR EXAMEN Y BLOQUES CORREGIDO ---
+
         window.deleteExam = async function() {
             if (!editingExamId) return;
             if (!confirm("¿Eliminar este examen y SUS BLOQUES DE ESTUDIO ASOCIADOS?")) return;
             
             try {
-                // 1. Eliminar el examen
                 await remove(ref(db, `exams/${currentUser.uid}/${editingExamId}`));
-                
-                // 2. Limpiar los bloques de estudio usando la función mejorada
                 await clearBlocksForExam(editingExamId);
-                
                 closeExamModal();
                 alert("Examen y bloques eliminados correctamente.");
             } catch(e) {
@@ -1289,283 +1542,281 @@
             }
         };
 
-        // --- MOTOR INTELIGENTE DE BLOQUES ---
-        
-        // Función auxiliar para limpiar bloques viejos (CORREGIDA)
-        async function clearBlocksForExam(examId) {
-            // CORRECCIÓN: Buscamos directamente en la base de datos para asegurar que encontramos los bloques
-            // incluso si la memoria local no se ha actualizado.
-            const snapshot = await get(ref(db, `studyBlocks/${currentUser.uid}`));
-            const blocks = snapshot.val() || {};
+        // Marcar examen como completado/pendiente desde el checkbox
+        window.toggleExamCompleted = async function(examId) {
+            const exam = appData.exams[examId];
+            if (!exam) return;
+            const newState = !exam.completed;
             
-            const updates = {};
-            let count = 0;
+            await update(ref(db, `exams/${currentUser.uid}/${examId}`), { completed: newState });
             
-            for (const [id, block] of Object.entries(blocks)) {
-                // Si el bloque pertenece a este examen, lo marcamos para borrar
-                if (block.examId === examId) {
-                    updates[`studyBlocks/${currentUser.uid}/${id}`] = null;
-                    count++;
-                }
+            if (newState) {
+                // Al completar, se eliminan sus bloques de estudio
+                await clearBlocksForExam(examId);
+            } else if (exam.important) {
+                // Al reactivar, se regeneran
+                await clearBlocksForExam(examId);
+                await generateSmartStudyBlocks(examId, exam);
             }
-            
-            // Si hay bloques para borrar, ejecutamos la actualización
-            if (Object.keys(updates).length > 0) {
-                await update(ref(db), updates);
-                console.log(`Eliminados ${count} bloques de estudio.`);
-            }
-        }
-
-        async function generateSmartStudyBlocks(examId, exam) {
-            const now = new Date();
-            const examDate = new Date(exam.date + 'T23:59');
-            const totalDays = Math.ceil((examDate - now) / (1000 * 60 * 60 * 24));
-
-            if (totalDays <= 0) return;
-
-            const maxBlocks = 6;
-            const blocksToGenerate = [];
-            const step = Math.max(2, Math.floor(totalDays / (maxBlocks + 1)));
-            
-            let localBusySlots = []; 
-
-            for (let d = 1; d <= totalDays; d++) {
-                if (blocksToGenerate.length >= maxBlocks) break;
-                if (d % step !== 0 && blocksToGenerate.length > 0) continue;
-
-                const blockDate = new Date(now);
-                blockDate.setDate(blockDate.getDate() + d);
-                const dateStr = blockDate.toISOString().split('T')[0];
-
-                const slot = findBestSlot(dateStr, localBusySlots);
-                
-                if (slot) {
-                    const blockData = {
-                        examId: examId,
-                        examTitle: exam.title,
-                        subjectId: exam.subjectId,
-                        date: dateStr,
-                        startHour: slot.start,
-                        endHour: slot.end,
-                        duration: 120
-                    };
-                    blocksToGenerate.push(blockData);
-                    localBusySlots.push({ date: dateStr, start: slot.start, end: slot.end });
-                }
-            }
-
-            for (const block of blocksToGenerate) {
-                await push(ref(db, `studyBlocks/${currentUser.uid}`), block);
-            }
-        }
-
-        function findBestSlot(dateStr, localBusySlots) {
-            const dayLetter = ['D', 'L', 'M', 'X', 'J', 'V', 'S'][new Date(dateStr).getDay()];
-            
-            let occupiedMinutes = [];
-            const addRange = (start, end) => { for(let i=start; i<end; i++) occupiedMinutes.push(i); };
-
-            addRange(0, 420); // Dormir inicio
-            addRange(1350, 1440); // Dormir fin
-            addRange(720, 780); // Almuerzo
-
-            if(appData.classSchedule && appData.classSchedule[dayLetter]) {
-                const c = appData.classSchedule[dayLetter];
-                if(c.start && c.end) addRange(timeToMins(c.start), timeToMins(c.end));
-            }
-            if(appData.workSchedule && appData.workSchedule[dayLetter]) {
-                const w = appData.workSchedule[dayLetter];
-                if(w.start && w.end) addRange(timeToMins(w.start), timeToMins(w.end));
-            }
-            Object.values(appData.tasks).forEach(t => {
-                if(t.recommendedStart && t.recommendedStart.startsWith(dateStr)) {
-                    const h = new Date(t.recommendedStart).getHours();
-                    const duration = t.duration || 60;
-                    addRange(h*60, h*60 + duration);
-                }
-            });
-            Object.values(appData.studyBlocks).forEach(b => {
-                if(b.date === dateStr) addRange(timeToMins(b.startHour), timeToMins(b.endHour));
-            });
-            localBusySlots.forEach(b => {
-                if(b.date === dateStr) addRange(timeToMins(b.start), timeToMins(b.end));
-            });
-
-            const ranges = [[420, 720], [780, 1080], [1080, 1290]];
-            ranges.sort(() => Math.random() - 0.5);
-
-            for (let range of ranges) {
-                for (let m = range[0]; m < range[1]; m += 30) {
-                    let end = m + 120;
-                    let isFree = true;
-                    for (let k = m; k < end; k++) {
-                        if (occupiedMinutes.includes(k)) { isFree = false; break; }
-                    }
-                    if (isFree) return { start: minsToTime(m), end: minsToTime(end) };
-                }
-            }
-            return null;
-        }
-
-        function timeToMins(t) { if(!t) return 0; const p=t.split(':'); return parseInt(p[0])*60+parseInt(p[1]); }
-        function minsToTime(m) { const h=Math.floor(m/60); const min=m%60; return `${h.toString().padStart(2,'0')}:${min.toString().padStart(2,'0')}`; }
-
-        window.generateStudyBlocks = async function() {
-            if(!confirm("Esto regenerará los bloques para todos los exámenes importantes. ¿Continuar?")) return;
-            
-            const importantExams = Object.entries(appData.exams).filter(([id,e]) => e.important && !e.completed);
-            if(importantExams.length === 0) return alert("No hay exámenes importantes.");
-
-            await set(ref(db, `studyBlocks/${currentUser.uid}`), {});
-            appData.studyBlocks = {};
-
-            for(const [id, exam] of importantExams) {
-                await generateSmartStudyBlocks(id, exam);
-            }
-            alert("Bloques regenerados inteligentemente.");
         };
 
-        // --- RENDERIZADOS ---
-        
+        // ==========================================================
+        // RENDERIZADO
+        // ==========================================================
         window.filterExams = function(filter) {
             currentFilter = filter;
-            document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
-            event.target.classList.add('active');
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            const tab = $('tab-' + filter);
+            if (tab) tab.classList.add('active');
             renderExams();
         };
 
+        function daysUntil(dateStr) {
+            const today = new Date(); today.setHours(0, 0, 0, 0);
+            return Math.round((strToDate(dateStr) - today) / 86400000);
+        }
+
         function renderExams() {
-            const container = $('examList');
-            const exams = Object.entries(appData.exams || {});
-            
+            const list = $('examList');
+            let exams = Object.entries(appData.exams);
+
+            // Filtro
+            if (currentFilter === 'pending') exams = exams.filter(([, e]) => !e.completed);
+            else if (currentFilter === 'completed') exams = exams.filter(([, e]) => e.completed);
+            else if (currentFilter === 'important') exams = exams.filter(([, e]) => e.important);
+
+            // Ordenar por fecha
+            exams.sort((a, b) => strToDate(a[1].date) - strToDate(b[1].date));
+
             if (exams.length === 0) {
-                container.innerHTML = `<div class="empty-state"><i class="fas fa-file-alt"></i><h4>No hay examenes registrados</h4><p>Crea tu primer examen</p></div>`;
+                list.innerHTML = `
+                    <div class="empty-state">
+                        <i class="fas fa-file-alt"></i>
+                        <h4>No hay examenes aqui</h4>
+                        <p>Registra un examen nuevo con el boton "Nuevo Examen"</p>
+                    </div>`;
                 return;
             }
 
-            const now = new Date();
-            now.setHours(0, 0, 0, 0);
-
-            let filteredExams = exams.map(([id, exam]) => ({ id, ...exam }));
-            
-            if (currentFilter === 'pending') filteredExams = filteredExams.filter(e => !e.completed);
-            else if (currentFilter === 'completed') filteredExams = filteredExams.filter(e => e.completed);
-            else if (currentFilter === 'important') filteredExams = filteredExams.filter(e => e.important && !e.completed);
-
-            filteredExams.sort((a, b) => new Date(a.date) - new Date(b.date));
-
-            container.innerHTML = filteredExams.map(exam => {
-                const subject = appData.subjects[exam.subjectId] || { name: 'Sin materia', color: '#9a9a9a', icon: '📝' };
-                const examDate = new Date(exam.date + 'T' + (exam.time || '00:00'));
-                const diffTime = examDate - new Date();
-                const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+            list.innerHTML = exams.map(([id, exam]) => {
+                const subject = appData.subjects[exam.subjectId] || { name: 'Sin materia' };
+                const days = daysUntil(exam.date);
                 
-                let urgencyClass = 'calm', badgeClass = 'calm', daysText = `${diffDays} dias`;
-                if (diffDays <= 3) { urgencyClass = 'urgent'; badgeClass = 'urgent'; if (diffDays === 0) daysText = 'Hoy'; else if (diffDays === 1) daysText = 'Manana'; else if (diffDays < 0) daysText = 'Vencido'; }
-                else if (diffDays <= 14) { urgencyClass = 'warning'; badgeClass = 'warning'; }
+                let badgeClass = 'calm';
+                let badgeText = `${days} dias`;
+                if (days < 0) { badgeText = 'Pasado'; badgeClass = 'calm'; }
+                else if (days === 0) { badgeText = '¡Hoy!'; badgeClass = 'urgent'; }
+                else if (days < 3) { badgeClass = 'urgent'; }
+                else if (days <= 14) { badgeClass = 'warning'; }
+
+                const cardClass = exam.completed ? 'completed' : (days < 0 ? '' : badgeClass);
+                const dateFormatted = strToDate(exam.date).toLocaleDateString('es-ES', { weekday: 'short', day: 'numeric', month: 'short' });
 
                 return `
-                    <div class="exam-card ${urgencyClass} ${exam.completed ? 'completed' : ''}" onclick="openExamModal('${exam.id}')">
-                        ${exam.important ? '<span class="important-badge"><i class="fas fa-star"></i> Importante</span>' : ''}
-                        <div class="exam-checkbox ${exam.completed ? 'checked' : ''}" onclick="event.stopPropagation(); toggleExamComplete('${exam.id}')">${exam.completed ? '<i class="fas fa-check"></i>' : ''}</div>
-                        <div class="exam-content">
-                            <h4>${exam.title}</h4>
-                            <p>${exam.description || 'Sin descripcion'}</p>
-                            <div class="exam-meta">
-                                <span class="exam-meta-item" style="color: ${subject.color}"><i class="fas fa-book"></i> ${subject.name}</span>
-                                <span class="exam-meta-item"><i class="fas fa-calendar"></i> ${formatDate(exam.date)}</span>
-                            </div>
+                <div class="exam-card ${cardClass}" onclick="openExamModal('${id}')">
+                    ${exam.important ? '<div class="important-badge">IMPORTANTE</div>' : ''}
+                    <div class="exam-checkbox ${exam.completed ? 'checked' : ''}" onclick="event.stopPropagation(); toggleExamCompleted('${id}')">
+                        ${exam.completed ? '<i class="fas fa-check"></i>' : ''}
+                    </div>
+                    <div class="exam-content">
+                        <h4>${exam.title}</h4>
+                        <p>${subject.name}${exam.description ? ' — ' + exam.description.substring(0, 60) : ''}</p>
+                        <div class="exam-meta">
+                            <span class="exam-meta-item"><i class="fas fa-calendar"></i> ${dateFormatted}</span>
+                            <span class="exam-meta-item"><i class="fas fa-clock"></i> ${exam.time || '--'}</span>
+                            ${exam.weight ? `<span class="exam-meta-item"><i class="fas fa-percent"></i> ${exam.weight}%</span>` : ''}
                         </div>
-                        <div class="exam-days-badge ${badgeClass}">${daysText}</div>
-                    </div>`;
+                    </div>
+                    <div class="exam-days-badge ${days < 0 ? 'calm' : badgeClass}">
+                        ${exam.completed ? 'Hecho' : badgeText}
+                    </div>
+                </div>`;
             }).join('');
         }
 
-        window.toggleExamComplete = async function(examId) {
-            const exam = appData.exams[examId];
-            if (!exam) return;
-            await update(ref(db, `exams/${currentUser.uid}/${examId}`), { completed: !exam.completed });
+        function updateStats() {
+            let urgent = 0, warning = 0, calm = 0;
+            
+            Object.values(appData.exams).forEach(e => {
+                if (e.completed) return;
+                const days = daysUntil(e.date);
+                if (days < 0) return;
+                if (days < 3) urgent++;
+                else if (days <= 14) warning++;
+                else calm++;
+            });
+
+            $('urgentCount').textContent = urgent;
+            $('warningCount').textContent = warning;
+            $('calmCount').textContent = calm;
+        }
+
+        // ==========================================================
+        // Bloques de Estudio (render)
+        // ==========================================================
+        function renderStudyBlocks() {
+            const blocks = Object.entries(appData.studyBlocks)
+                .map(([id, b]) => ({ id, ...b }))
+                .filter(b => {
+                    const parent = appData.exams[b.examId];
+                    return !parent || !parent.completed; // ocultar si el examen ya esta hecho
+                })
+                .sort((a, b) => {
+                    const da = a.date + ' ' + (a.startHour || '');
+                    const db = b.date + ' ' + (b.startHour || '');
+                    return da.localeCompare(db);
+                });
+
+            // Proximo bloque
+            const now = new Date();
+            const next = blocks.find(b => new Date(b.date + 'T' + (b.startHour || '00:00')) >= now);
+
+            if (next) {
+                const d = strToDate(next.date);
+                const dateLabel = d.toLocaleDateString('es-ES', { weekday: 'long', day: 'numeric', month: 'long' });
+                $('nextBlockTime').textContent = `${dateLabel} · ${next.startHour}`;
+                $('nextBlockSubject').textContent = `Estudio: ${next.examTitle || ''}`;
+            } else {
+                $('nextBlockTime').textContent = 'Sin bloques programados';
+                $('nextBlockSubject').textContent = '';
+            }
+
+            // Lista
+            const listEl = $('studyBlockList');
+            if (blocks.length === 0) {
+                listEl.innerHTML = '<div style="text-align:center; padding:15px; font-size:0.8rem; color:var(--text-muted);">No hay bloques. Marca un examen como importante para generarlos.</div>';
+                return;
+            }
+
+            listEl.innerHTML = blocks.map(b => {
+                const d = strToDate(b.date);
+                const dateLabel = d.toLocaleDateString('es-ES', { weekday: 'short', day: 'numeric', month: 'short' });
+                return `
+                <div class="study-block-item">
+                    <div>
+                        <div class="block-time">${dateLabel} · ${b.startHour} - ${b.endHour}</div>
+                        <div class="block-exam"><i class="fas fa-book" style="margin-right:4px;"></i>${b.examTitle || 'Estudio'}</div>
+                    </div>
+                    <button class="delete-block" onclick="deleteStudyBlock('${b.id}')"><i class="fas fa-trash"></i></button>
+                </div>`;
+            }).join('');
+        }
+
+        window.deleteStudyBlock = async function(blockId) {
+            await remove(ref(db, `studyBlocks/${currentUser.uid}/${blockId}`));
         };
 
-        function updateStats() {
-            const now = new Date(); now.setHours(0, 0, 0, 0);
-            let urgent = 0, warning = 0, calm = 0;
-            Object.values(appData.exams || {}).forEach(exam => {
-                if (exam.completed) return;
-                const examDate = new Date(exam.date);
-                const diffDays = Math.ceil((examDate - now) / (1000 * 60 * 60 * 24));
-                if (diffDays <= 3) urgent++; else if (diffDays <= 14) warning++; else calm++;
+        // ==========================================================
+        // Materias
+        // ==========================================================
+        function populateSubjectDropdowns() {
+            const selects = [$('inputExamSubject'), $('inputNoteSubject')];
+            const subjects = Object.entries(appData.subjects);
+            
+            selects.forEach(sel => {
+                if (!sel) return;
+                const current = sel.value;
+                sel.innerHTML = '<option value="">Seleccionar materia...</option>' +
+                    subjects.map(([id, s]) => `<option value="${id}">${s.name}</option>`).join('');
+                if (current) sel.value = current;
             });
-            $('urgentCount').textContent = urgent; $('warningCount').textContent = warning; $('calmCount').textContent = calm;
+        }
+
+        window.addSubjectQuick = async function() {
+            const name = prompt('Nombre de la nueva materia:');
+            if (!name || !name.trim()) return;
+            try {
+                const color = `hsl(${Math.floor(Math.random() * 360)}, 60%, 65%)`;
+                await push(ref(db, `subjects/${currentUser.uid}`), { name: name.trim(), color: color });
+            } catch (e) {
+                alert('Error al crear la materia: ' + e.message);
+            }
+        };
+
+        // ==========================================================
+        // Simulador y Notas
+        // ==========================================================
+        function populateExamDropdowns() {
+            const sel = $('simExamSelect');
+            if (!sel) return;
+            const exams = Object.values(appData.exams);
+            sel.innerHTML = '<option value="">Seleccionar...</option>' +
+                exams.map(e => `<option value="${e.title}">${e.title}</option>`).join('');
         }
 
         window.simulateGrade = function() {
-            const expectedGrade = parseFloat($('simExpectedGrade').value) || 0;
-            const weight = parseFloat($('simWeight').value) || 0;
-            const currentAvg = parseFloat($('simCurrentAvg').value) || 0;
-            if (weight <= 0 || weight > 100) { alert('Ingresa un peso valido'); return; }
-            const newAvg = (currentAvg * (1 - weight/100)) + (expectedGrade * weight/100);
+            const weight = parseFloat($('simWeight').value);
+            const expected = parseFloat($('simExpectedGrade').value);
+            const current = parseFloat($('simCurrentAvg').value);
+
+            if (isNaN(weight) || isNaN(expected) || isNaN(current)) {
+                alert('Por favor completa todos los campos del simulador.');
+                return;
+            }
+
+            const newAvg = current + (expected - current) * (weight / 100);
             $('simResult').textContent = newAvg.toFixed(1);
         };
 
-        window.openNoteModal = function() { populateNoteSubjectDropdown(); $('noteModal').classList.add('active'); };
+        function renderNotes() {
+            const list = $('notesList');
+            const notes = Object.entries(appData.notes);
+            
+            if (notes.length === 0) {
+                list.innerHTML = '<div style="text-align:center; padding:15px; font-size:0.8rem; color:var(--text-muted);">No hay notas guardadas</div>';
+                return;
+            }
+
+            list.innerHTML = notes.map(([id, n]) => {
+                const subject = appData.subjects[n.subjectId] || { name: 'General' };
+                return `
+                <div class="note-item">
+                    <div>
+                        <h5>${n.name || 'Evaluacion'}</h5>
+                        <p>${subject.name}</p>
+                    </div>
+                    <div style="display:flex; align-items:center; gap:8px;">
+                        <span class="note-grade">${n.grade}</span>
+                        <button class="delete-note" onclick="deleteNote('${id}')"><i class="fas fa-trash" style="font-size:0.7rem;"></i></button>
+                    </div>
+                </div>`;
+            }).join('');
+        }
+
+        window.deleteNote = async function(noteId) {
+            await remove(ref(db, `notes/${currentUser.uid}/${noteId}`));
+        };
+
+        window.openNoteModal = function() {
+            populateSubjectDropdowns();
+            $('inputNoteName').value = '';
+            $('inputNoteGrade').value = '';
+            $('noteModal').classList.add('active');
+        };
+
         window.closeNoteModal = () => $('noteModal').classList.remove('active');
 
         window.saveNote = async function() {
             const subjectId = $('inputNoteSubject').value;
             const name = $('inputNoteName').value.trim();
             const grade = parseFloat($('inputNoteGrade').value);
-            if (!name || isNaN(grade)) { alert('Por favor completa todos los campos'); return; }
-            await push(ref(db, `notes/${currentUser.uid}`), { subjectId, name, grade, date: Date.now() });
-            closeNoteModal(); $('inputNoteName').value = ''; $('inputNoteGrade').value = '';
-        };
 
-        function renderNotes() {
-            const container = $('notesList');
-            const notes = Object.entries(appData.notes || {});
-            if (notes.length === 0) { container.innerHTML = '<p style="text-align: center; color: var(--text-muted); font-size: 0.85rem;">Sin notas</p>'; return; }
-            container.innerHTML = notes.map(([id, note]) => {
-                const subject = appData.subjects[note.subjectId] || { name: 'General', color: '#9a9a9a' };
-                return `<div class="note-item" style="border-left-color: ${subject.color}"><span class="note-grade">${note.grade}</span><h5>${note.name}</h5><p>${subject.name}</p></div>`;
-            }).join('');
-        }
+            if (!subjectId) { alert('Selecciona una materia'); return; }
+            if (!name) { alert('Ingresa el nombre de la evaluacion'); return; }
+            if (isNaN(grade)) { alert('Ingresa la nota obtenida'); return; }
 
-        function renderStudyBlocks() {
-            const container = $('studyBlockList');
-            const blocks = Object.entries(appData.studyBlocks || {});
-            if (blocks.length === 0) { container.innerHTML = '<p style="text-align: center; color: var(--text-muted); font-size: 0.85rem;">Sin bloques</p>'; $('nextBlockTime').textContent = 'Sin bloques'; $('nextBlockSubject').textContent = ''; return; }
-            
-            const sortedBlocks = blocks.map(([id, b]) => ({ id, ...b })).sort((a, b) => new Date(a.date + 'T' + a.startHour) - new Date(b.date + 'T' + b.startHour));
-            const now = new Date();
-            const nextBlock = sortedBlocks.find(b => new Date(b.date + 'T' + b.startHour) > now);
-            
-            if (nextBlock) {
-                const subject = appData.subjects[nextBlock.subjectId] || { name: 'Estudio', icon: '📚' };
-                const blockDate = new Date(nextBlock.date);
-                $('nextBlockTime').textContent = `${blockDate.toLocaleDateString('es-ES', { weekday: 'long', day: 'numeric', month: 'short' })} de ${nextBlock.startHour} a ${nextBlock.endHour}`;
-                $('nextBlockSubject').textContent = `${subject.icon} ${nextBlock.examTitle}`;
+            try {
+                await push(ref(db, `notes/${currentUser.uid}`), {
+                    subjectId,
+                    name,
+                    grade,
+                    createdAt: Date.now()
+                });
+                closeNoteModal();
+            } catch (e) {
+                alert('Error al guardar la nota: ' + e.message);
             }
-
-            container.innerHTML = sortedBlocks.slice(0, 5).map(block => {
-                const subject = appData.subjects[block.subjectId] || { name: 'Estudio', color: '#9a9a9a' };
-                const blockDate = new Date(block.date);
-                return `<div class="study-block-item"><div><div class="block-time">${blockDate.toLocaleDateString('es-ES', { weekday: 'short', day: 'numeric' })} - ${block.startHour}</div><div class="block-exam">${subject.icon || '📚'} ${block.examTitle}</div></div><button class="delete-block" onclick="event.stopPropagation(); deleteStudyBlock('${block.id}')"><i class="fas fa-trash"></i></button></div>`;
-            }).join('');
-        }
-
-        window.deleteStudyBlock = async function(blockId) {
-            if (confirm('Eliminar este bloque?')) await remove(ref(db, `studyBlocks/${currentUser.uid}/${blockId}`));
         };
-
-        function formatDate(dateStr) { if (!dateStr) return ''; return new Date(dateStr + 'T12:00:00').toLocaleDateString('es-ES', { day: 'numeric', month: 'short' }); }
-        function populateSubjectDropdowns() { const subjects = appData.subjects || {}; $('inputExamSubject').innerHTML = `<option value="">Seleccionar</option>${Object.entries(subjects).map(([id, s]) => `<option value="${id}">${s.name}</option>`).join('')}`; }
-        function populateNoteSubjectDropdown() { const subjects = appData.subjects || {}; $('inputNoteSubject').innerHTML = `<option value="">Seleccionar</option>${Object.entries(subjects).map(([id, s]) => `<option value="${id}">${s.name}</option>`).join('')}`; }
-        function populateExamDropdowns() { const exams = appData.exams || {}; $('simExamSelect').innerHTML = `<option value="">Seleccionar</option>${Object.entries(exams).filter(([id, e]) => !e.completed).map(([id, e]) => `<option value="${id}">${e.title}</option>`).join('')}`; }
-
-        document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { closeExamModal(); closeNoteModal(); } });
-        $('examModal').addEventListener('click', (e) => { if (e.target === $('examModal')) closeExamModal(); });
-        $('noteModal').addEventListener('click', (e) => { if (e.target === $('noteModal')) closeNoteModal(); });
-        window.signOut = () => auth.signOut();
     </script>
 </body>
 </html>
