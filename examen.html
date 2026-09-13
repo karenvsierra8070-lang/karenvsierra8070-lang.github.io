@@ -1223,14 +1223,12 @@
         const DAY_LETTERS = ['D', 'L', 'M', 'X', 'J', 'V', 'S'];
 
         // ==========================================================
-        // FIX #3: FECHAS DE LOS BLOQUES
-        // NUEVO: el MISMO día del examen ahora es candidato (si el
-        // examen es de noche, la mañana de ese día sirve para
-        // estudiar). findBestSlot decide si ese día realmente tiene
-        // hueco antes del examen; si no cabe, se omite solo.
-        // Luego va el día anterior y hacia atrás con saltos 2, 3, 4...
-        // Ejemplos (examen lejano): examen 20 ago -> 20(candidato),
-        // 19, 17, 14, 10...
+        // FECHAS DE LOS BLOQUES (patrón preferido)
+        // 1er candidato: el mismo día del examen (si es de noche, la
+        // mañana sirve). Luego el día anterior y hacia atrás con
+        // saltos crecientes 2, 3, 4...
+        // Si esos días están llenos, generateSmartStudyBlocks usa
+        // días intermedios como respaldo.
         // ==========================================================
         function getBlockDates(examDateStr, maxBlocks = 6) {
             const today = new Date();
@@ -1241,11 +1239,8 @@
             if (totalDays < 0) return []; // solo si el examen ya pasó
 
             const dates = [];
+            dates.push(dateToStr(exam)); // mismo día del examen
 
-            // NUEVO: el día del examen es el primer candidato
-            dates.push(dateToStr(exam));
-
-            // Día anterior al examen y hacia atrás con saltos crecientes
             const cursor = new Date(exam);
             cursor.setDate(cursor.getDate() - 1);
             let gap = 2;
@@ -1260,29 +1255,42 @@
 
         // ==========================================================
         // Generador principal
+        // - Prioridad: patrón de fechas (mismo día, anterior, saltos)
+        // - Respaldo: cualquier otro día entre hoy y el examen con
+        //   espacio disponible, para no quedarte nunca sin bloques
         // ==========================================================
         async function generateSmartStudyBlocks(examId, exam) {
-            const dates = getBlockDates(exam.date);
-            if (dates.length === 0) return 0;
+            const today = new Date(); today.setHours(0, 0, 0, 0);
+            const examDay = strToDate(exam.date);
+            const totalDays = Math.round((examDay - today) / 86400000);
+            if (totalDays < 0) return 0;
 
-            const usedStarts = new Set(); // FIX #1: no repetir la misma hora
-            const localBlocks = [];       // bloques recien creados en esta pasada
+            // 1) Días del patrón preferido
+            const patternDates = getBlockDates(exam.date);
+
+            // 2) Respaldo: todos los días entre hoy y el examen,
+            //    ordenados del más cercano al examen hacia atrás
+            const allDates = [];
+            for (let off = totalDays; off >= 0; off--) {
+                const d = new Date(today);
+                d.setDate(d.getDate() + off);
+                allDates.push(dateToStr(d));
+            }
+            const orderedDates = [...patternDates];
+            allDates.forEach(d => { if (!orderedDates.includes(d)) orderedDates.push(d); });
+
+            const usedStarts = new Set(); // no repetir la misma hora
+            const usedDates = new Set();  // máximo 1 bloque por día
+            const localBlocks = [];       // bloques de esta pasada
             let created = 0;
+            const maxBlocks = 6;
 
-            for (const dateStr of dates) {
-                // 1) Intentar bloque completo de 2 horas
-                let slot = findBestSlot(dateStr, exam, usedStarts, localBlocks, 120);
-                let usedDuration = 120;
+            for (const dateStr of orderedDates) {
+                if (created >= maxBlocks) break;
+                if (usedDates.has(dateStr)) continue;
 
-                // 2) NUEVO: si es el día del examen y no cupo el de
-                //    2 horas, intentar uno corto de 1 hora
-                //    (mejor estudiar 1 hora que nada).
-                if (!slot && dateStr === exam.date) {
-                    slot = findBestSlot(dateStr, exam, usedStarts, localBlocks, 60);
-                    if (slot) usedDuration = 60;
-                }
-
-                if (!slot) continue; // día lleno o ya no hay tiempo -> se omite
+                const slot = findBestSlot(dateStr, exam, usedStarts, localBlocks, 120);
+                if (!slot) continue; // ese día no tiene hueco válido
 
                 const blockData = {
                     examId: examId,
@@ -1291,26 +1299,42 @@
                     date: dateStr,
                     startHour: slot.start,
                     endHour: slot.end,
-                    duration: usedDuration
+                    duration: slot.duration
                 };
 
                 await push(ref(db, `studyBlocks/${currentUser.uid}`), blockData);
                 localBlocks.push(blockData);
                 usedStarts.add(slot.start);
+                usedDates.add(dateStr);
                 created++;
             }
             return created;
         }
 
         // ==========================================================
-        // FIX #1 y #2: Busca un hueco REALMENTE libre y varia la hora.
-        // NUEVO: recibe la duración como parámetro y respeta la hora
-        // del examen si es su mismo día. Lee los datos EXACTAMENTE
-        // como los lee horario.html.
+        // Busca un hueco VÁLIDO para estudiar:
+        // - Ventana: 08:00 a 21:00 (de 21:00 a 08:00 es sueño, jamás)
+        // - Almuerzo 12:00-13:00 bloqueado
+        // - Clases y Trabajo: bloqueados + 1h de transporte antes y
+        //   después (misma regla que el motor de tareas)
+        // - Tareas, otros bloques y exámenes de ese día (±30 min)
+        // - Duración ADAPTATIVA: entre 30 min y 2 horas según el
+        //   hueco real disponible (nunca sesiones de minutos)
         // ==========================================================
-        function findBestSlot(dateStr, exam, usedStarts, localBlocks, duration = 120) {
-            const DAY_START = 8 * 60;   // 08:00
-            let dayEnd = 17 * 60;       // 17:00 por defecto
+        function findBestSlot(dateStr, exam, usedStarts, localBlocks, preferredDuration = 120) {
+            const MIN_DURATION = 30;     // sesión mínima: 30 minutos
+            const DAY_START = 8 * 60;    // 08:00
+            const SLEEP_START = 21 * 60; // 21:00 (después es sueño)
+            const TRANSPORT = 60;        // 1h de transporte antes/después de clases y trabajo
+
+            let dayEnd = SLEEP_START;
+
+            // Mismo día del examen: terminar 30 min antes de que
+            // empiece, sin pasarse de las 21:00 por la regla de sueño
+            if (dateStr === exam.date && exam.time) {
+                dayEnd = Math.min(dayEnd, timeToMins(exam.time) - 30);
+            }
+            if (dayEnd <= DAY_START) return null;
 
             const busy = [];
             const addRange = (s, e) => {
@@ -1321,36 +1345,29 @@
             // Almuerzo 12:00 - 13:00
             addRange(12 * 60, 13 * 60);
 
-            // NUEVO: si es el MISMO día del examen, el bloque debe
-            // terminar 30 min antes de que empiece el examen.
-            // Ese día ya no se limita a las 17:00: si el examen es a
-            // las 21:00, se puede estudiar hasta las 20:30.
-            // (Si prefieres cortar a las 17:00 igual, usa:
-            //  dayEnd = Math.min(17 * 60, timeToMins(exam.time) - 30);)
-            if (dateStr === exam.date && exam.time) {
-                dayEnd = timeToMins(exam.time) - 30;
-            }
-
             const dayLetter = DAY_LETTERS[strToDate(dateStr).getDay()];
 
-            // Clases de ese día (misma estructura que horario.html)
+            // Clases + transporte (1h antes y 1h después)
             const c = (appData.classSchedule || {})[dayLetter];
-            if (c && c.start && c.end) addRange(timeToMins(c.start), timeToMins(c.end));
-
-            // Trabajo de ese día (solo si el usuario trabaja)
-            if ((appData.settings || {}).works === 'si') {
-                const w = (appData.workSchedule || {})[dayLetter];
-                if (w && w.start && w.end) addRange(timeToMins(w.start), timeToMins(w.end));
+            if (c && c.start && c.end) {
+                addRange(timeToMins(c.start) - TRANSPORT, timeToMins(c.end) + TRANSPORT);
             }
 
-            // Tareas de ese día (formato de horario.html: recommendedStart ISO + duration)
+            // Trabajo + transporte (solo si el usuario trabaja)
+            if ((appData.settings || {}).works === 'si') {
+                const w = (appData.workSchedule || {})[dayLetter];
+                if (w && w.start && w.end) {
+                    addRange(timeToMins(w.start) - TRANSPORT, timeToMins(w.end) + TRANSPORT);
+                }
+            }
+
+            // Tareas de ese día
             Object.values(appData.tasks || {}).forEach(t => {
                 if (!t || t.completed || !t.recommendedStart) return;
                 const td = new Date(t.recommendedStart);
                 if (dateToStr(td) !== dateStr) return;
                 const s = td.getHours() * 60 + td.getMinutes();
-                const dur = t.duration || 60;
-                addRange(s, s + dur);
+                addRange(s, s + (t.duration || 60));
             });
 
             // Otros bloques de estudio ya guardados en Firebase
@@ -1365,8 +1382,7 @@
                 if (b.date === dateStr) addRange(timeToMins(b.startHour), timeToMins(b.endHour));
             });
 
-            // TODOS los exámenes de ese día, incluido el actual
-            // (doble seguridad para no pisarlo nunca)
+            // Todos los exámenes de ese día, incluido el actual
             Object.values(appData.exams || {}).forEach(e => {
                 if (!e || e.completed) return;
                 if (e.date === dateStr && e.time) {
@@ -1375,7 +1391,7 @@
                 }
             });
 
-            // Calcular huecos libres dentro de [08:00, dayEnd]
+            // Huecos libres en [08:00, dayEnd]
             busy.sort((a, b) => a[0] - b[0]);
             const free = [];
             let cursor = DAY_START;
@@ -1386,10 +1402,14 @@
             }
             if (cursor < dayEnd) free.push([cursor, dayEnd]);
 
-            // Todas las horas de inicio posibles (cada 30 min)
+            // Candidatos: duración ADAPTATIVA según el hueco
+            // (mínimo 30 min, máximo 2 horas, múltiplos de 30 min)
             let candidates = [];
             free.forEach(([ws, we]) => {
-                for (let s = ws; s + duration <= we; s += 30) candidates.push(s);
+                const avail = we - ws;
+                if (avail < MIN_DURATION) return;
+                const dur = Math.max(MIN_DURATION, Math.min(preferredDuration, Math.floor(avail / 30) * 30));
+                for (let s = ws; s + dur <= we; s += 30) candidates.push({ start: s, dur: dur });
             });
             if (candidates.length === 0) return null;
 
@@ -1397,17 +1417,20 @@
             const now = new Date();
             if (dateStr === dateToStr(now)) {
                 const nowMins = now.getHours() * 60 + now.getMinutes() + 30;
-                candidates = candidates.filter(s => s >= nowMins);
+                candidates = candidates.filter(c => c.start >= nowMins);
                 if (candidates.length === 0) return null;
             }
 
-            // FIX #1: descartar horas ya usadas en otros bloques y
-            // elegir AL AZAR (rompe el patrón repetitivo)
-            let pool = candidates.filter(s => !usedStarts.has(s));
+            // No repetir horas ya usadas + elegir al azar
+            let pool = candidates.filter(c => !usedStarts.has(minsToTime(c.start)));
             if (pool.length === 0) pool = candidates;
 
-            const start = pool[Math.floor(Math.random() * pool.length)];
-            return { start: minsToTime(start), end: minsToTime(start + duration) };
+            const pick = pool[Math.floor(Math.random() * pool.length)];
+            return {
+                start: minsToTime(pick.start),
+                end: minsToTime(pick.start + pick.dur),
+                duration: pick.dur
+            };
         }
 
         // ==========================================================
