@@ -1117,8 +1117,6 @@
 
         let currentFilter = 'all';
         let editingExamId = null;
-
-        // Control de la purga automatica de bloques zombis
         let autoPurgeDone = false;
 
         const $ = (id) => document.getElementById(id);
@@ -1178,17 +1176,43 @@
         }
 
         // ==========================================================
-        // PURGA AUTOMATICA: al abrir la pagina (una sola vez), borra
-        // de la base de datos TODOS los bloques que no correspondan
-        // a un examen vigente y futuro. Esto elimina los "zombis"
-        // dejados por versiones anteriores del generador: bloques
-        // de exámenes ya vencidos, completados o eliminados.
+        // PURGA AUTOMATICA AL ABRIR LA PAGINA.
+        // Un bloque NUNCA puede estar despues de su propio examen
+        // (en fecha posterior, o el mismo dia a partir de la hora).
+        // Tambien borra: huerfanos, examen completado, examen
+        // vencido, bloque pasado y datos corruptos.
         // ==========================================================
         function maybeAutoPurge() {
             if (autoPurgeDone) return;
             if (!appData.exams || !appData.studyBlocks) return;
             autoPurgeDone = true;
             purgeInvalidBlocks();
+        }
+
+        // Devuelve el motivo de invalidacion de un bloque, o null si es valido
+        function getBlockInvalidReason(b, now) {
+            const parent = b.examId ? appData.exams[b.examId] : null;
+
+            // 1) Huerfano: el examen fue eliminado
+            if (!parent) return 'huerfano';
+
+            // 2) Examen completado
+            if (parent.completed) return 'completado';
+
+            // 3) Examen vencido (fecha+hora pasadas) o datos invalidos
+            const examStart = getExamStart(parent);
+            if (!examStart || examStart <= now) return 'examen_vencido';
+
+            // 4) Bloque pasado o corrupto
+            const bStart = new Date((b.date || '') + 'T' + (b.startHour || '00:00'));
+            if (isNaN(bStart.getTime())) return 'corrupto';
+            if (bStart < now) return 'bloque_pasado';
+
+            // 5) REGLA CLAVE: el bloque esta DESPUES de su examen
+            if ((b.date || '') > parent.date) return 'despues_del_examen';
+            if ((b.date || '') === parent.date && bStart >= examStart) return 'despues_del_examen';
+
+            return null;
         }
 
         async function purgeInvalidBlocks() {
@@ -1199,27 +1223,7 @@
             let purged = 0;
 
             for (const [id, b] of Object.entries(blocks)) {
-                let invalid = false;
-
-                // 1) Bloque sin examen padre -> huérfano (el examen fue eliminado)
-                const parent = b.examId ? appData.exams[b.examId] : null;
-                if (!parent) {
-                    invalid = true;
-                } else {
-                    // 2) Examen completado -> bloque inválido
-                    if (parent.completed) invalid = true;
-
-                    // 3) Examen vencido (fecha+hora pasadas) o sin fecha/hora
-                    //    válidas -> bloque inválido
-                    const examStart = getExamStart(parent);
-                    if (!examStart || examStart <= now) invalid = true;
-                }
-
-                // 4) El propio bloque ya pasó (hora vencida)
-                const bStart = new Date((b.date || '') + 'T' + (b.startHour || '00:00'));
-                if (isNaN(bStart.getTime()) || bStart < now) invalid = true;
-
-                if (invalid) {
+                if (getBlockInvalidReason(b, now)) {
                     updates[`studyBlocks/${currentUser.uid}/${id}`] = null;
                     purged++;
                 }
@@ -1279,8 +1283,7 @@
 
         const DAY_LETTERS = ['D', 'L', 'M', 'X', 'J', 'V', 'S'];
 
-        // Fecha+hora ABSOLUTA del examen. Si la hora esta vacia o
-        // corrupta devuelve null (quien llama asume examen vencido).
+        // Fecha+hora ABSOLUTA del examen. Hora vacia/corrupta -> null.
         function getExamStart(exam) {
             if (!exam || !exam.date) return null;
             const timeOk = exam.time && /^\d{1,2}:\d{2}/.test(exam.time);
@@ -1288,10 +1291,24 @@
             return isNaN(d.getTime()) ? null : d;
         }
 
+        // Umbral que separa los DOS PATRONES:
+        // <= 2 dias -> CERCANO | > 2 dias -> LEJANO
+        const NEAR_EXAM_DAYS = 2;
+
         // ==========================================================
-        // FECHAS DE LOS BLOQUES (patrón preferido)
-        // Para un examen de mañana esto devuelve EXACTAMENTE:
-        // [mañana, hoy]. Jamás incluye días después del examen.
+        // FECHAS DE LOS BLOQUES - LOS DOS PATRONES:
+        //
+        // PATRON CERCANO (examen en 1-2 dias o menos):
+        //   Dias anteriores disponibles + el DIA DEL EXAMEN por la
+        //   manana (findBestSlot lo corta 30 min antes del examen).
+        //   Examen manana -> [manana, hoy]
+        //
+        // PATRON LEJANO (examen a mas de 2 dias):
+        //   Dia anterior al examen, luego saltos CRECIENTES
+        //   (2, 3, 4, 5 dias). El dia del examen NO se incluye.
+        //   Verificado con los ejemplos originales:
+        //   - Examen 12 ago -> 11, 9
+        //   - Examen 20 ago -> 19, 17, 14, 10
         // ==========================================================
         function getBlockDates(examDateStr, maxBlocks = 6) {
             const today = new Date();
@@ -1302,25 +1319,43 @@
             if (totalDays < 0) return []; // examen ya pasado
 
             const dates = [];
-            dates.push(dateToStr(exam)); // mismo día del examen
 
-            const cursor = new Date(exam);
-            cursor.setDate(cursor.getDate() - 1);
-            let gap = 2;
-
-            while (dates.length < maxBlocks && cursor >= today) {
-                dates.push(dateToStr(cursor));
-                cursor.setDate(cursor.getDate() - gap);
-                gap++;
+            if (totalDays <= NEAR_EXAM_DAYS) {
+                // ---- PATRON CERCANO ----
+                // El dia del examen por la manana SI es candidato
+                dates.push(dateToStr(exam));
+                // y hacia atras dia por dia hasta hoy
+                const cursor = new Date(exam);
+                cursor.setDate(cursor.getDate() - 1);
+                while (dates.length < maxBlocks && cursor >= today) {
+                    dates.push(dateToStr(cursor));
+                    cursor.setDate(cursor.getDate() - 1);
+                }
+            } else {
+                // ---- PATRON LEJANO ----
+                // Empieza en (examen - 1) y retrocede con saltos
+                // crecientes: -2, -3, -4, -5...
+                // El dia del examen NO es candidato.
+                const cursor = new Date(exam);
+                cursor.setDate(cursor.getDate() - 1);
+                let gap = 2;
+                while (dates.length < maxBlocks && cursor >= today) {
+                    dates.push(dateToStr(cursor));
+                    cursor.setDate(cursor.getDate() - gap);
+                    gap++;
+                }
             }
             return dates;
         }
 
         // ==========================================================
         // Generador principal
-        // - CANDADO 1: examen vencido -> cero bloques
-        // - Prioridad: patrón; respaldo: días intermedios (solo
-        //   entre HOY y el examen, nunca después)
+        // - Examen vencido -> cero bloques
+        // - Prioridad: patron (cercano o lejano segun el caso)
+        // - Respaldo: si los dias del patron estan llenos, usa
+        //   otros dias entre HOY y el examen. En modo LEJANO el
+        //   dia del examen queda excluido del respaldo.
+        // - Verificacion final: cada bloque termina ANTES del examen
         // ==========================================================
         async function generateSmartStudyBlocks(examId, exam) {
             const examStart = getExamStart(exam);
@@ -1331,11 +1366,16 @@
             const totalDays = Math.round((examDay - today) / 86400000);
             if (totalDays < 0) return 0;
 
+            const isNear = totalDays <= NEAR_EXAM_DAYS;
+
+            // 1) Dias del patron correspondiente
             const patternDates = getBlockDates(exam.date);
 
-            // Respaldo: SOLO días entre hoy y el examen (inclusive)
+            // 2) Respaldo: dias entre hoy y el examen (excluyendo el
+            //    dia del examen si el patron es LEJANO)
             const allDates = [];
             for (let off = totalDays; off >= 0; off--) {
+                if (!isNear && off === totalDays) continue; // lejano: sin dia del examen
                 const d = new Date(today);
                 d.setDate(d.getDate() + off);
                 allDates.push(dateToStr(d));
@@ -1355,6 +1395,12 @@
 
                 const slot = findBestSlot(dateStr, exam, usedStarts, localBlocks, 120);
                 if (!slot) continue;
+
+                // VERIFICACION FINAL: el bloque debe iniciar y
+                // terminar estrictamente ANTES del examen
+                const bStartDT = new Date(dateStr + 'T' + slot.start);
+                const bEndDT = new Date(dateStr + 'T' + slot.end);
+                if (bStartDT >= examStart || bEndDT > examStart) continue;
 
                 const blockData = {
                     examId: examId,
@@ -1376,14 +1422,15 @@
         }
 
         // ==========================================================
-        // Busca un hueco VÁLIDO:
-        // - Ventana 08:00-21:00 (21:00-08:00 sueño, jamás)
+        // Busca un hueco VALIDO:
+        // - Ventana 08:00-21:00 (21:00-08:00 sueno, jamas)
         // - Almuerzo 12:00-13:00 bloqueado
-        // - Clases/Trabajo + 1h transporte antes y después
-        // - Tareas, otros bloques, exámenes del día (±30 min)
-        // - CANDADO 2: día del examen, todo bloque termina 30 min
-        //   antes del examen; hora inválida -> día descartado
-        // - Duración adaptativa: 30 min mínimo, 2 h máximo
+        // - Clases/Trabajo + 1h de transporte antes y despues
+        // - Tareas, otros bloques, examenes del dia (+30 min antes)
+        // - Dia del examen: TODO bloque termina 30 min antes del
+        //   examen (por eso "por la manana" solo si queda tiempo).
+        //   Hora invalida -> ese dia se descarta entero.
+        // - Duracion adaptativa: minimo 30 min, maximo 2 h
         // ==========================================================
         function findBestSlot(dateStr, exam, usedStarts, localBlocks, preferredDuration = 120) {
             const MIN_DURATION = 30;
@@ -1393,6 +1440,8 @@
 
             let dayEnd = SLEEP_START;
 
+            // Tope duro por la hora del examen el mismo dia.
+            // Hora invalida -> examMins = 0 -> dia descartado.
             if (dateStr === exam.date) {
                 const examMins = (exam.time && /^\d{1,2}:\d{2}/.test(exam.time)) ? timeToMins(exam.time) : 0;
                 dayEnd = Math.min(dayEnd, examMins - 30);
@@ -1410,7 +1459,7 @@
 
             const dayLetter = DAY_LETTERS[strToDate(dateStr).getDay()];
 
-            // Clases + transporte (1h antes y 1h después)
+            // Clases + transporte (1h antes y 1h despues)
             const c = (appData.classSchedule || {})[dayLetter];
             if (c && c.start && c.end) {
                 addRange(timeToMins(c.start) - TRANSPORT, timeToMins(c.end) + TRANSPORT);
@@ -1424,7 +1473,7 @@
                 }
             }
 
-            // Tareas de ese día
+            // Tareas de ese dia
             Object.values(appData.tasks || {}).forEach(t => {
                 if (!t || t.completed || !t.recommendedStart) return;
                 const td = new Date(t.recommendedStart);
@@ -1440,12 +1489,12 @@
                 }
             });
 
-            // Bloques creados en esta misma generación
+            // Bloques creados en esta misma generacion
             (localBlocks || []).forEach(b => {
                 if (b.date === dateStr) addRange(timeToMins(b.startHour), timeToMins(b.endHour));
             });
 
-            // Todos los exámenes de ese día (incluido el actual)
+            // Todos los examenes de ese dia (incluido el actual)
             Object.values(appData.exams || {}).forEach(e => {
                 if (!e || e.completed) return;
                 if (e.date === dateStr && e.time) {
@@ -1465,7 +1514,7 @@
             }
             if (cursor < dayEnd) free.push([cursor, dayEnd]);
 
-            // Candidatos: duración adaptativa (30 min a 2 h)
+            // Candidatos: duracion adaptativa (30 min a 2 h)
             let candidates = [];
             free.forEach(([ws, we]) => {
                 const avail = we - ws;
@@ -1496,7 +1545,7 @@
         }
 
         // ==========================================================
-        // Limpia los bloques de un examen específico
+        // Limpia los bloques de un examen especifico
         // ==========================================================
         async function clearBlocksForExam(examId) {
             const snapshot = await get(ref(db, `studyBlocks/${currentUser.uid}`));
@@ -1516,19 +1565,14 @@
         }
 
         // ==========================================================
-        // Boton "Regenerar"
-        // NUEVO: primero PURGA todos los bloques zombis de la base de
-        // datos (de exámenes vencidos, completados o eliminados) y
-        // LUEGO regenera solo los exámenes vigentes. Así nunca
-        // quedan residuos de generaciones anteriores mezclados.
+        // Boton "Regenerar": purga invalidos y regenera con el
+        // patron correcto segun cercania de cada examen
         // ==========================================================
         window.generateStudyBlocks = async function() {
             if (!currentUser) return;
 
-            // PASO 1: purga global de zombis
             const purged = await purgeInvalidBlocks();
 
-            // PASO 2: exámenes candidatos (importantes, vigentes, futuros)
             const pending = Object.entries(appData.exams).filter(([, e]) => {
                 if (!e.important || e.completed) return false;
                 const examStart = getExamStart(e);
@@ -1537,11 +1581,11 @@
 
             if (pending.length === 0) {
                 alert(purged > 0
-                    ? `Se eliminaron ${purged} bloques obsoletos. No hay exámenes importantes pendientes para generar bloques.`
-                    : 'No hay exámenes importantes pendientes (con fecha y hora futuras) para generar bloques.');
+                    ? `Se eliminaron ${purged} bloque(s) obsoleto(s). No hay examenes importantes pendientes para generar bloques.`
+                    : 'No hay examenes importantes pendientes para generar bloques.');
                 return;
             }
-            if (!confirm(`Se purgaron ${purged} bloque(s) obsoleto(s).\nSe regenerarán los bloques de ${pending.length} examen(es). ¿Continuar?`)) return;
+            if (!confirm(`Se purgaron ${purged} bloque(s) obsoleto(s).\nSe regeneraran los bloques de ${pending.length} examen(es). ¿Continuar?`)) return;
 
             for (const [id, exam] of pending) {
                 await clearBlocksForExam(id);
@@ -1598,8 +1642,8 @@
             const title = $('inputExamTitle').value.trim();
             const subjectId = $('inputExamSubject').value;
             const date = $('inputExamDate').value;
-            // Si borra la hora, se fuerza "09:00" para que nunca
-            // exista un examen sin hora (causaba el agujero del candado)
+            // Si borra la hora, se fuerza "09:00": nunca debe existir
+            // un examen sin hora
             const time = $('inputExamTime').value || '09:00';
             const description = $('inputExamDesc').value.trim();
             const weight = parseInt($('inputExamWeight').value) || 0;
@@ -1677,7 +1721,7 @@
                 await clearBlocksForExam(examId);
             } else if (exam.important) {
                 await clearBlocksForExam(examId);
-                await generateSmartStudyBlocks(examId, exam); // no genera nada si ya venció
+                await generateSmartStudyBlocks(examId, exam); // no genera nada si ya vencio
             }
         };
 
@@ -1771,34 +1815,13 @@
         }
 
         // ==========================================================
-        // Bloques de Estudio (render)
-        // FILTRO TRIPLE: solo se muestran bloques cuyo examen padre
-        // existe, no está completado y sigue vigente (fecha+hora
-        // futura), Y cuyo propio horario no ha pasado aún.
+        // Bloques de Estudio (render) - filtro por validez
         // ==========================================================
         function renderStudyBlocks() {
             const now = new Date();
             const blocks = Object.entries(appData.studyBlocks)
                 .map(([id, b]) => ({ id, ...b }))
-                .filter(b => {
-                    // 1) El examen padre debe existir (si fue eliminado,
-                    //    el bloque es huérfano y se oculta)
-                    const parent = b.examId ? appData.exams[b.examId] : null;
-                    if (!parent) return false;
-
-                    // 2) El examen no debe estar completado
-                    if (parent.completed) return false;
-
-                    // 3) El examen debe seguir vigente (fecha+hora futuras)
-                    const examStart = getExamStart(parent);
-                    if (!examStart || examStart <= now) return false;
-
-                    // 4) El propio bloque no debe haber pasado aún
-                    const bStart = new Date(b.date + 'T' + (b.startHour || '00:00'));
-                    if (isNaN(bStart.getTime()) || bStart < now) return false;
-
-                    return true;
-                })
+                .filter(b => getBlockInvalidReason(b, now) === null)
                 .sort((a, b) => {
                     const da = a.date + ' ' + (a.startHour || '');
                     const db = b.date + ' ' + (b.startHour || '');
