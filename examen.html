@@ -1197,7 +1197,7 @@
 
         // ==========================================================
         // UTILIDADES DE FECHA
-        // FIX: usar siempre hora LOCAL. new Date('2025-08-12') se
+        // FIX: usar siempre hora LOCAL. new Date('2026-08-12') se
         // interpreta como UTC y desfasa el dia en zonas como
         // Colombia (UTC-5). Estas funciones lo evitan.
         // ==========================================================
@@ -1224,10 +1224,13 @@
 
         // ==========================================================
         // FIX #3: FECHAS DE LOS BLOQUES
-        // Empieza el dia ANTERIOR al examen y retrocede con saltos
-        // crecientes (2, 3, 4, 5...). Verificado con tus ejemplos:
-        //  - Examen 12 ago (hoy 8)  -> 11, 9
-        //  - Examen 20 ago (hoy 8)  -> 19, 17, 14, 10
+        // NUEVO: el MISMO día del examen ahora es candidato (si el
+        // examen es de noche, la mañana de ese día sirve para
+        // estudiar). findBestSlot decide si ese día realmente tiene
+        // hueco antes del examen; si no cabe, se omite solo.
+        // Luego va el día anterior y hacia atrás con saltos 2, 3, 4...
+        // Ejemplos (examen lejano): examen 20 ago -> 20(candidato),
+        // 19, 17, 14, 10...
         // ==========================================================
         function getBlockDates(examDateStr, maxBlocks = 6) {
             const today = new Date();
@@ -1235,11 +1238,16 @@
             const exam = strToDate(examDateStr);
             const totalDays = Math.round((exam - today) / 86400000);
 
-            if (totalDays < 1) return []; // examen hoy o pasado -> sin bloques
+            if (totalDays < 0) return []; // solo si el examen ya pasó
 
             const dates = [];
+
+            // NUEVO: el día del examen es el primer candidato
+            dates.push(dateToStr(exam));
+
+            // Día anterior al examen y hacia atrás con saltos crecientes
             const cursor = new Date(exam);
-            cursor.setDate(cursor.getDate() - 1); // dia anterior al examen
+            cursor.setDate(cursor.getDate() - 1);
             let gap = 2;
 
             while (dates.length < maxBlocks && cursor >= today) {
@@ -1251,7 +1259,7 @@
         }
 
         // ==========================================================
-        // MOTOR INTELIGENTE DE BLOQUES
+        // Generador principal
         // ==========================================================
         async function generateSmartStudyBlocks(examId, exam) {
             const dates = getBlockDates(exam.date);
@@ -1262,8 +1270,19 @@
             let created = 0;
 
             for (const dateStr of dates) {
-                const slot = findBestSlot(dateStr, examId, usedStarts, localBlocks);
-                if (!slot) continue; // dia lleno -> se omite (equivale a "1 dia mas")
+                // 1) Intentar bloque completo de 2 horas
+                let slot = findBestSlot(dateStr, exam, usedStarts, localBlocks, 120);
+                let usedDuration = 120;
+
+                // 2) NUEVO: si es el día del examen y no cupo el de
+                //    2 horas, intentar uno corto de 1 hora
+                //    (mejor estudiar 1 hora que nada).
+                if (!slot && dateStr === exam.date) {
+                    slot = findBestSlot(dateStr, exam, usedStarts, localBlocks, 60);
+                    if (slot) usedDuration = 60;
+                }
+
+                if (!slot) continue; // día lleno o ya no hay tiempo -> se omite
 
                 const blockData = {
                     examId: examId,
@@ -1272,7 +1291,7 @@
                     date: dateStr,
                     startHour: slot.start,
                     endHour: slot.end,
-                    duration: 120
+                    duration: usedDuration
                 };
 
                 await push(ref(db, `studyBlocks/${currentUser.uid}`), blockData);
@@ -1284,13 +1303,14 @@
         }
 
         // ==========================================================
-        // FIX #1 y #2: Busca un hueco REALMENTE libre y varia la hora
-        // Lee los datos EXACTAMENTE como los lee horario.html
+        // FIX #1 y #2: Busca un hueco REALMENTE libre y varia la hora.
+        // NUEVO: recibe la duración como parámetro y respeta la hora
+        // del examen si es su mismo día. Lee los datos EXACTAMENTE
+        // como los lee horario.html.
         // ==========================================================
-        function findBestSlot(dateStr, currentExamId, usedStarts, localBlocks) {
-            const DURATION = 120;       // bloques de 2 horas
+        function findBestSlot(dateStr, exam, usedStarts, localBlocks, duration = 120) {
             const DAY_START = 8 * 60;   // 08:00
-            const DAY_END   = 17 * 60;  // 17:00
+            let dayEnd = 17 * 60;       // 17:00 por defecto
 
             const busy = [];
             const addRange = (s, e) => {
@@ -1301,19 +1321,29 @@
             // Almuerzo 12:00 - 13:00
             addRange(12 * 60, 13 * 60);
 
+            // NUEVO: si es el MISMO día del examen, el bloque debe
+            // terminar 30 min antes de que empiece el examen.
+            // Ese día ya no se limita a las 17:00: si el examen es a
+            // las 21:00, se puede estudiar hasta las 20:30.
+            // (Si prefieres cortar a las 17:00 igual, usa:
+            //  dayEnd = Math.min(17 * 60, timeToMins(exam.time) - 30);)
+            if (dateStr === exam.date && exam.time) {
+                dayEnd = timeToMins(exam.time) - 30;
+            }
+
             const dayLetter = DAY_LETTERS[strToDate(dateStr).getDay()];
 
-            // Clases de ese dia (misma estructura que horario.html)
+            // Clases de ese día (misma estructura que horario.html)
             const c = (appData.classSchedule || {})[dayLetter];
             if (c && c.start && c.end) addRange(timeToMins(c.start), timeToMins(c.end));
 
-            // Trabajo de ese dia (solo si el usuario trabaja, igual que horario.html)
+            // Trabajo de ese día (solo si el usuario trabaja)
             if ((appData.settings || {}).works === 'si') {
                 const w = (appData.workSchedule || {})[dayLetter];
                 if (w && w.start && w.end) addRange(timeToMins(w.start), timeToMins(w.end));
             }
 
-            // Tareas de ese dia (formato de horario.html: recommendedStart ISO + duration)
+            // Tareas de ese día (formato de horario.html: recommendedStart ISO + duration)
             Object.values(appData.tasks || {}).forEach(t => {
                 if (!t || t.completed || !t.recommendedStart) return;
                 const td = new Date(t.recommendedStart);
@@ -1330,38 +1360,36 @@
                 }
             });
 
-            // Bloques creados en esta misma generacion
+            // Bloques creados en esta misma generación
             (localBlocks || []).forEach(b => {
                 if (b.date === dateStr) addRange(timeToMins(b.startHour), timeToMins(b.endHour));
             });
 
-            // FIX: No chocar con OTROS examenes registrados ese dia
-            // (ni con el mismo examen si se cambia la hora)
-            Object.entries(appData.exams || {}).forEach(([id, e]) => {
-                if (id === currentExamId) return;
-                if (e.completed) return;
+            // TODOS los exámenes de ese día, incluido el actual
+            // (doble seguridad para no pisarlo nunca)
+            Object.values(appData.exams || {}).forEach(e => {
+                if (!e || e.completed) return;
                 if (e.date === dateStr && e.time) {
                     const s = timeToMins(e.time);
-                    const dur = e.duration || 120;
-                    addRange(s - 30, s + dur); // media hora antes tambien
+                    addRange(s - 30, s + (e.duration || 120)); // media hora antes también
                 }
             });
 
-            // Calcular huecos libres dentro de la ventana 8:00 - 17:00
+            // Calcular huecos libres dentro de [08:00, dayEnd]
             busy.sort((a, b) => a[0] - b[0]);
             const free = [];
             let cursor = DAY_START;
             for (const [s, e] of busy) {
-                if (s > cursor) free.push([cursor, Math.min(s, DAY_END)]);
+                if (s > cursor) free.push([cursor, Math.min(s, dayEnd)]);
                 cursor = Math.max(cursor, e);
-                if (cursor >= DAY_END) break;
+                if (cursor >= dayEnd) break;
             }
-            if (cursor < DAY_END) free.push([cursor, DAY_END]);
+            if (cursor < dayEnd) free.push([cursor, dayEnd]);
 
             // Todas las horas de inicio posibles (cada 30 min)
             let candidates = [];
             free.forEach(([ws, we]) => {
-                for (let s = ws; s + DURATION <= we; s += 30) candidates.push(s);
+                for (let s = ws; s + duration <= we; s += 30) candidates.push(s);
             });
             if (candidates.length === 0) return null;
 
@@ -1374,12 +1402,12 @@
             }
 
             // FIX #1: descartar horas ya usadas en otros bloques y
-            // elegir AL AZAR (rompe el patron repetitivo)
+            // elegir AL AZAR (rompe el patrón repetitivo)
             let pool = candidates.filter(s => !usedStarts.has(s));
             if (pool.length === 0) pool = candidates;
 
             const start = pool[Math.floor(Math.random() * pool.length)];
-            return { start: minsToTime(start), end: minsToTime(start + DURATION) };
+            return { start: minsToTime(start), end: minsToTime(start + duration) };
         }
 
         // ==========================================================
@@ -1659,7 +1687,7 @@
                 .map(([id, b]) => ({ id, ...b }))
                 .filter(b => {
                     const parent = appData.exams[b.examId];
-                    return !parent || !parent.completed; // ocultar si el examen ya esta hecho
+                    return !parent || !parent.completed; // ocultar si el examen ya está hecho
                 })
                 .sort((a, b) => {
                     const da = a.date + ' ' + (a.startHour || '');
@@ -1691,10 +1719,11 @@
             listEl.innerHTML = blocks.map(b => {
                 const d = strToDate(b.date);
                 const dateLabel = d.toLocaleDateString('es-ES', { weekday: 'short', day: 'numeric', month: 'short' });
+                const durLabel = b.duration ? ` (${b.duration} min)` : '';
                 return `
                 <div class="study-block-item">
                     <div>
-                        <div class="block-time">${dateLabel} · ${b.startHour} - ${b.endHour}</div>
+                        <div class="block-time">${dateLabel} · ${b.startHour} - ${b.endHour}${durLabel}</div>
                         <div class="block-exam"><i class="fas fa-book" style="margin-right:4px;"></i>${b.examTitle || 'Estudio'}</div>
                     </div>
                     <button class="delete-block" onclick="deleteStudyBlock('${b.id}')"><i class="fas fa-trash"></i></button>
