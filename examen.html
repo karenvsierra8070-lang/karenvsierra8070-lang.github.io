@@ -1306,9 +1306,10 @@
         // PATRON LEJANO (examen a mas de 2 dias):
         //   Dia anterior al examen, luego saltos CRECIENTES
         //   (2, 3, 4, 5 dias). El dia del examen NO se incluye.
-        //   Verificado con los ejemplos originales:
-        //   - Examen 12 ago -> 11, 9
-        //   - Examen 20 ago -> 19, 17, 14, 10
+        //   Ejemplos:
+        //   - Hoy 13, examen 17 (4 dias) -> [16, 14]
+        //   - Examen 12 ago, hoy 8  -> [11, 9]
+        //   - Examen 20 ago, hoy 8  -> [19, 17, 14, 10]
         // ==========================================================
         function getBlockDates(examDateStr, maxBlocks = 6) {
             const today = new Date();
@@ -1335,7 +1336,6 @@
                 // ---- PATRON LEJANO ----
                 // Empieza en (examen - 1) y retrocede con saltos
                 // crecientes: -2, -3, -4, -5...
-                // El dia del examen NO es candidato.
                 const cursor = new Date(exam);
                 cursor.setDate(cursor.getDate() - 1);
                 let gap = 2;
@@ -1349,13 +1349,14 @@
         }
 
         // ==========================================================
-        // Generador principal
-        // - Examen vencido -> cero bloques
-        // - Prioridad: patron (cercano o lejano segun el caso)
-        // - Respaldo: si los dias del patron estan llenos, usa
-        //   otros dias entre HOY y el examen. En modo LEJANO el
-        //   dia del examen queda excluido del respaldo.
-        // - Verificacion final: cada bloque termina ANTES del examen
+        // Generador principal - CORREGIDO:
+        // FASE 1: crea bloques SOLO en los dias del patron
+        //         (ej: hoy 13, examen 17 -> SOLO 16 y 14).
+        // FASE 2: SOLO si un dia del patron fallo (dia lleno, sin
+        //         hueco), busca UN dia sustituto por cada fallo.
+        //         El TOTAL de bloques NUNCA supera al del patron.
+        //         (Antes el respaldo rellenaba TODOS los dias
+        //         libres: por eso salia del 13 al 17.)
         // ==========================================================
         async function generateSmartStudyBlocks(examId, exam) {
             const examStart = getExamStart(exam);
@@ -1368,39 +1369,28 @@
 
             const isNear = totalDays <= NEAR_EXAM_DAYS;
 
-            // 1) Dias del patron correspondiente
+            // Dias EXACTOS del patron
             const patternDates = getBlockDates(exam.date);
-
-            // 2) Respaldo: dias entre hoy y el examen (excluyendo el
-            //    dia del examen si el patron es LEJANO)
-            const allDates = [];
-            for (let off = totalDays; off >= 0; off--) {
-                if (!isNear && off === totalDays) continue; // lejano: sin dia del examen
-                const d = new Date(today);
-                d.setDate(d.getDate() + off);
-                allDates.push(dateToStr(d));
-            }
-            const orderedDates = [...patternDates];
-            allDates.forEach(d => { if (!orderedDates.includes(d)) orderedDates.push(d); });
+            if (patternDates.length === 0) return 0;
 
             const usedStarts = new Set();
             const usedDates = new Set();
             const localBlocks = [];
+            const failedPattern = [];
             let created = 0;
-            const maxBlocks = 6;
 
-            for (const dateStr of orderedDates) {
-                if (created >= maxBlocks) break;
-                if (usedDates.has(dateStr)) continue;
-
+            // ---------- FASE 1: dias del patron ----------
+            for (const dateStr of patternDates) {
                 const slot = findBestSlot(dateStr, exam, usedStarts, localBlocks, 120);
-                if (!slot) continue;
+                if (!slot) { failedPattern.push(dateStr); continue; }
 
-                // VERIFICACION FINAL: el bloque debe iniciar y
-                // terminar estrictamente ANTES del examen
+                // El bloque debe iniciar y terminar ANTES del examen
                 const bStartDT = new Date(dateStr + 'T' + slot.start);
                 const bEndDT = new Date(dateStr + 'T' + slot.end);
-                if (bStartDT >= examStart || bEndDT > examStart) continue;
+                if (bStartDT >= examStart || bEndDT > examStart) {
+                    failedPattern.push(dateStr);
+                    continue;
+                }
 
                 const blockData = {
                     examId: examId,
@@ -1418,6 +1408,61 @@
                 usedDates.add(dateStr);
                 created++;
             }
+
+            // ---------- FASE 2: SOLO sustitutos ----------
+            // Por CADA dia del patron que fallo (dia lleno), buscar
+            // UN dia de reemplazo. Nunca dias adicionales.
+            if (failedPattern.length > 0) {
+                // Candidatos: dias entre hoy y el examen, de mas
+                // cercano al examen hacia atras, excluyendo los dias
+                // del patron y los ya usados. En modo LEJANO se
+                // excluye el dia del examen.
+                const candidates = [];
+                for (let off = totalDays; off >= 0; off--) {
+                    if (!isNear && off === totalDays) continue; // lejano: sin dia del examen
+                    const d = new Date(today);
+                    d.setDate(d.getDate() + off);
+                    const ds = dateToStr(d);
+                    if (patternDates.includes(ds) || usedDates.has(ds)) continue;
+                    candidates.push(ds);
+                }
+
+                for (const failDate of failedPattern) {
+                    if (created >= patternDates.length) break; // tope = tamano del patron
+                    let placed = false;
+
+                    for (const candDate of candidates) {
+                        if (usedDates.has(candDate)) continue;
+
+                        const slot = findBestSlot(candDate, exam, usedStarts, localBlocks, 120);
+                        if (!slot) continue;
+
+                        const bStartDT = new Date(candDate + 'T' + slot.start);
+                        const bEndDT = new Date(candDate + 'T' + slot.end);
+                        if (bStartDT >= examStart || bEndDT > examStart) continue;
+
+                        const blockData = {
+                            examId: examId,
+                            examTitle: exam.title,
+                            subjectId: exam.subjectId,
+                            date: candDate,
+                            startHour: slot.start,
+                            endHour: slot.end,
+                            duration: slot.duration
+                        };
+
+                        await push(ref(db, `studyBlocks/${currentUser.uid}`), blockData);
+                        localBlocks.push(blockData);
+                        usedStarts.add(slot.start);
+                        usedDates.add(candDate);
+                        created++;
+                        placed = true;
+                        break; // un solo sustituto por dia fallido
+                    }
+                    if (!placed) break; // no hay espacio en ningun lado, no forzar
+                }
+            }
+
             return created;
         }
 
@@ -1428,8 +1473,7 @@
         // - Clases/Trabajo + 1h de transporte antes y despues
         // - Tareas, otros bloques, examenes del dia (+30 min antes)
         // - Dia del examen: TODO bloque termina 30 min antes del
-        //   examen (por eso "por la manana" solo si queda tiempo).
-        //   Hora invalida -> ese dia se descarta entero.
+        //   examen. Hora invalida -> ese dia se descarta entero.
         // - Duracion adaptativa: minimo 30 min, maximo 2 h
         // ==========================================================
         function findBestSlot(dateStr, exam, usedStarts, localBlocks, preferredDuration = 120) {
@@ -1566,7 +1610,7 @@
 
         // ==========================================================
         // Boton "Regenerar": purga invalidos y regenera con el
-        // patron correcto segun cercania de cada examen
+        // patron correcto de cada examen
         // ==========================================================
         window.generateStudyBlocks = async function() {
             if (!currentUser) return;
