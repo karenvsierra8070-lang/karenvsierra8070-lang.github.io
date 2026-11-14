@@ -392,7 +392,7 @@
                         </div>
                         <div class="form-group">
                             <label>Tipo de Actividad</label>
-                            <select id="taskType">
+                            <select id="taskType" onchange="togglePagesField()">
                                 <option value="Tarea">Tarea</option>
                                 <option value="Proyecto">Proyecto</option>
                                 <option value="Ensayo">Ensayo</option>
@@ -407,6 +407,14 @@
                                 <option value="Preparación exposicion">Prep. Exposición</option>
                                 <option value="Curso">Curso</option>
                             </select>
+                        </div>
+                    </div>
+                    <!-- Campo dinámico para Lectura: pide páginas y calcula por 1 min 7 s/página -->
+                    <div class="form-group" id="pagesGroup" style="display:none;">
+                        <label>Número de páginas <span style="font-weight:400; color:var(--text-secondary);">(estimamos ~1 min 7 s por página)</span></label>
+                        <div class="inline-add">
+                            <input type="number" id="taskPages" min="1" step="1" placeholder="Ej: 25" style="flex:1;" oninput="updatePagesHint()">
+                            <span id="pagesHint" style="font-size:0.8rem; color:var(--text-secondary); white-space:nowrap;"></span>
                         </div>
                     </div>
                     <div class="form-row">
@@ -775,6 +783,30 @@
             $('stepsContainer').appendChild(div);
         };
 
+        // --- 6.1. CAMPO DINÁMICO: PÁGINAS PARA LECTURA ---
+        // Ritmo de lectura del usuario: ~1 minuto 7 segundos (67 s) por página.
+        const SECONDS_PER_PAGE = 67;
+
+        // Muestra el campo de páginas solo cuando el tipo es 'Lectura'.
+        window.togglePagesField = () => {
+            const isReading = $('taskType').value === 'Lectura';
+            $('pagesGroup').style.display = isReading ? 'block' : 'none';
+            updatePagesHint();
+        };
+
+        // Calcula y muestra en vivo cuánto tomará la lectura según las páginas ingresadas.
+        window.updatePagesHint = () => {
+            const hint = $('pagesHint');
+            const pages = parseInt($('taskPages').value, 10);
+            if (!pages || pages <= 0 || isNaN(pages)) { hint.innerText = ''; return; }
+            const totalSecs = pages * SECONDS_PER_PAGE;
+            const mins = Math.round(totalSecs / 60);
+            const hrs = Math.floor(mins / 60);
+            const remMin = mins % 60;
+            const txt = hrs > 0 ? `${hrs} h ${remMin} min` : `${mins} min`;
+            hint.innerText = `≈ ${txt} de lectura`;
+        };
+
         // --- 7. MOTOR DE RECOMENDACIÓN (CORE) ---
 
         // NUEVO: Ventanas horarias óptimas según la ciencia cognitiva.
@@ -798,6 +830,16 @@
         }
 
         function calculateEstimatedDuration(task) {
+            // CASO ESPECIAL: Lectura con número de páginas.
+            // Se estima a ~67 s por página (1 min 7 s), multiplicado por la dificultad.
+            if (task.type === 'Lectura' && task.pages && task.pages > 0) {
+                const totalSecs = task.pages * SECONDS_PER_PAGE;
+                let mins = totalSecs / 60;
+                if (task.difficulty === 'media') mins *= 1.3;
+                if (task.difficulty === 'alta') mins *= 1.6;
+                return Math.max(1, Math.round(mins));
+            }
+
             const stepsCount = task.steps ? task.steps.length : 0;
             let baseMinutes = 60;
             let minPerStep = 15, maxPerStep = 45;
@@ -1013,6 +1055,12 @@
                 difficulty: $('taskDifficulty').value, gradeValue: $('taskGradeUnk').checked ? 'unknown' : Number($('taskGrade').value || 0),
                 instructions: $('taskDesc').value, steps: steps, completed: false, createdAt: Date.now()
             };
+            // NUEVO: si es Lectura y se ingresaron páginas, las guardamos para que el
+            // motor estime la duración por 1 min 7 s/página en lugar del rango fijo.
+            if (taskObj.type === 'Lectura') {
+                const p = parseInt($('taskPages').value, 10);
+                if (p > 0) taskObj.pages = p;
+            }
             taskObj.estimatedDuration = calculateEstimatedDuration(taskObj);
             tempTaskData = taskObj;
 
@@ -1085,7 +1133,7 @@
             } catch(e) { alert("Error: " + e.message); }
         };
 
-        function resetForm() { $('taskForm').reset(); $('taskId').value = ''; $('stepsContainer').innerHTML = ''; $('modalTitle').innerText = "Nueva Tarea"; }
+        function resetForm() { $('taskForm').reset(); $('taskId').value = ''; $('stepsContainer').innerHTML = ''; $('modalTitle').innerText = "Nueva Tarea"; $('pagesGroup').style.display = 'none'; $('pagesHint').innerText = ''; }
 
         // --- 8. ESTADISTICAS ---
         function updateStats() {
@@ -1267,6 +1315,10 @@
             $('taskTitle').value = t.title;
             $('taskSubject').value = t.subjectId;
             $('taskType').value = t.type;
+            // NUEVO: si es Lectura, mostrar el campo y rellenar las páginas guardadas.
+            togglePagesField();
+            $('taskPages').value = t.pages || '';
+            updatePagesHint();
             $('taskDueDate').value = t.dueDate;
             $('taskDueTime').value = t.dueTime;
             $('taskMode').value = t.mode;
