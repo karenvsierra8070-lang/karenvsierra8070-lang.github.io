@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -210,6 +211,28 @@
         .rec-date { font-size: 2.8rem; font-weight: 700; color: var(--primary-dark); margin: 20px 0; line-height: 1.2; font-family: 'Playfair Display', serif; }
         .rec-reason { font-size: 0.95rem; color: var(--text-secondary); margin-bottom: 30px; background: var(--bg-primary); padding: 20px; border-radius: 15px; text-align: left; line-height: 1.6; border: 1px solid var(--border-color); white-space: pre-wrap; }
         .rec-alert { background: rgba(231, 76, 60, 0.1); color: var(--danger); padding: 15px 20px; border-radius: 10px; margin-bottom: 30px; border: 1px solid rgba(231, 76, 60, 0.3); display: none; font-weight: 600; text-align: center; }
+
+        /* --- VENTANA ÓPTIMA POR DIFICULTAD --- */
+        .rec-optimal {
+            background: linear-gradient(135deg, rgba(52, 152, 219, 0.08), rgba(46, 204, 113, 0.08));
+            border: 1px solid rgba(52, 152, 219, 0.25);
+            padding: 18px 22px; border-radius: 14px; margin-bottom: 20px;
+            display: flex; align-items: center; gap: 15px; text-align: left;
+        }
+        .rec-optimal i { font-size: 1.8rem; color: var(--info); flex-shrink: 0; }
+        .rec-optimal-text { flex: 1; }
+        .rec-optimal-text strong { display: block; color: var(--primary-dark); font-size: 0.95rem; margin-bottom: 2px; }
+        .rec-optimal-text span { font-size: 0.82rem; color: var(--text-secondary); }
+
+        /* Badge de horario óptimo */
+        .badge-optimal {
+            background: linear-gradient(135deg, rgba(52, 152, 219, 0.15), rgba(46, 204, 113, 0.15));
+            color: var(--info); border: 1px solid rgba(52, 152, 219, 0.3);
+            padding: 4px 10px; border-radius: 6px; font-size: 0.7rem;
+            font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px;
+            display: inline-flex; align-items: center; gap: 4px;
+        }
+        .badge-optimal.fallback { background: rgba(243, 156, 18, 0.12); color: var(--warning); border-color: rgba(243, 156, 18, 0.3); }
 
         /* --- POMODORO SCREEN --- */
         .pomo-screen { position: fixed; inset: 0; background: var(--bg-primary); z-index: 10005; display: none; flex-direction: column; justify-content: center; align-items: center; padding: 20px; text-align: center; }
@@ -452,6 +475,13 @@
                     <div class="rec-icon"><i class="fas fa-lightbulb"></i></div>
                     <p style="font-size:0.95rem; color:var(--text-secondary); font-weight: 500;">Para terminar a tiempo, te sugerimos empezar el:</p>
                     <div class="rec-date" id="recDateText">--</div>
+                    <div class="rec-optimal" id="recOptimalBox" style="display:none;">
+                        <i class="fas fa-brain"></i>
+                        <div class="rec-optimal-text">
+                            <strong id="recOptimalTitle">Horario óptimo según ciencia</strong>
+                            <span id="recOptimalDesc">--</span>
+                        </div>
+                    </div>
                     <div class="rec-reason" id="recReasonText">Calculando...</div>
                     <div class="rec-alert" id="recAlert"><i class="fas fa-exclamation-circle"></i> ¡Alerta! Tiempo justo. Se recomienda empezar ya.</div>
                 </div>
@@ -746,6 +776,27 @@
         };
 
         // --- 7. MOTOR DE RECOMENDACIÓN (CORE) ---
+
+        // NUEVO: Ventanas horarias óptimas según la ciencia cognitiva.
+        // - Dificultad alta: mejor foco analítico entre 9:00 y 12:00 (pico de alerta).
+        // - Dificultad media: tarde, 14:00 a 16:00 (recuperación post-almuerzo).
+        // - Dificultad baja: cualquier horario hábil (no bloquea por ventana).
+        // Las horas están en formato 24h y son comparadas en minutos locales.
+        const OPTIMAL_WINDOWS = {
+            alta:  { start: 9 * 60,  end: 12 * 60, label: '9:00 AM – 12:00 PM', desc: 'Mejor foco analítico de la mañana (pico de alerta cognitiva).' },
+            media: { start: 14 * 60, end: 16 * 60, label: '2:00 PM – 4:00 PM',  desc: 'Recuperación productiva de la tarde tras el almuerzo.' },
+            baja:  { start: 0,        end: 24 * 60, label: 'Cualquier horario',   desc: 'Tarea sencilla: no requiere ventana específica.' }
+        };
+
+        // Devuelve true si el slot [start, end] cae COMPLETO dentro de la ventana
+        // óptima definida para la dificultad de la tarea. Para 'baja' siempre true.
+        function isInOptimalWindow(start, end, difficulty) {
+            const w = OPTIMAL_WINDOWS[difficulty] || OPTIMAL_WINDOWS.baja;
+            const startMins = start.getHours() * 60 + start.getMinutes();
+            const endMins   = end.getHours()   * 60 + end.getMinutes();
+            return startMins >= w.start && endMins <= w.end;
+        }
+
         function calculateEstimatedDuration(task) {
             const stepsCount = task.steps ? task.steps.length : 0;
             let baseMinutes = 60;
@@ -875,9 +926,12 @@
 
             let foundSlot = null;
             let isEmergencyOverride = false;
+            let usedOptimalWindow = false;  // NUEVO: marca si el slot respeta la ventana óptima
 
             // FUNCIÓN INTERNA PARA BUSCAR HUECOS (Recibe si puede o no ignorar el sueño)
-            const searchSlots = (allowSleep) => {
+            // NUEVO: parámetro optWin. Si viene definido, exige que el slot caiga dentro
+            // de esa ventana óptima (en minutos locales). Si es null, no filtra por ventana.
+            const searchSlots = (allowSleep, optWin) => {
                 let attempts = 0;
                 // Intento aleatorio
                 while(attempts < 100) {
@@ -887,6 +941,7 @@
                     const proposedStart = new Date(now.getTime() + randomOffset);
                     const proposedEnd = new Date(proposedStart.getTime() + duration * 60000);
                     proposedStart.setSeconds(0, 0); proposedEnd.setSeconds(0, 0);
+                    if (optWin && !isInOptimalWindow(proposedStart, proposedEnd, task.difficulty)) { attempts++; continue; }
                     // <-- AQUÍ SE LE MANDA EL allowSleep A isTimeSlotValid
                     if (proposedEnd < due && isTimeSlotValid(proposedStart, proposedEnd, allowSleep)) {
                         return { start: proposedStart, end: proposedEnd }; 
@@ -897,6 +952,10 @@
                 let currentScan = new Date(now.getTime() + 15 * 60000);
                 while(currentScan < limitDate) {
                     const proposedEnd = new Date(currentScan.getTime() + duration * 60000);
+                    if (optWin && !isInOptimalWindow(currentScan, proposedEnd, task.difficulty)) {
+                        currentScan.setMinutes(currentScan.getMinutes() + 15);
+                        continue;
+                    }
                     // <-- AQUÍ TAMBIÉN
                     if (proposedEnd < due && isTimeSlotValid(currentScan, proposedEnd, allowSleep)) {
                         return { start: new Date(currentScan), end: proposedEnd }; 
@@ -906,15 +965,26 @@
                 return null;
             };
 
-            // FASE 1: Búsqueda normal (Respetando sueño de 22:00 a 7:00 y tus clases)
-            foundSlot = searchSlots(false);
+            // FASE 0 (NUEVA): Buscar primero dentro de la ventana óptima de la dificultad.
+            // Para 'baja' optWin es null (no filtra), así que equivale a la búsqueda normal
+            // y siempre usará la ventana óptima. Para 'alta' y 'media' sí restringe.
+            const difficultyKey = task.difficulty || 'media';
+            const requireWindow = difficultyKey !== 'baja';
+            foundSlot = searchSlots(false, requireWindow ? difficultyKey : null);
+            if (foundSlot) usedOptimalWindow = true;
+
+            // FASE 1 (ANTIGUA, ahora FALLBACK): Búsqueda normal sin filtrar por ventana óptima.
+            // Solo se ejecuta si la FASE 0 no encontró nada -> se conserva el sistema anterior.
+            if (!foundSlot) {
+                foundSlot = searchSlots(false, null);
+            }
 
             // FASE 2: Si es URGENTE y no encontró nada, intenta ignorar la regla de sueño
             if (!foundSlot) {
                 const hoursLeft = (due - now) / (1000 * 60 * 60);
                 // Si quedan menos de 24 horas para entregar o la prioridad es alta
                 if (hoursLeft <= 24 || task.priority === 'alta') {
-                    foundSlot = searchSlots(true); // true = ignorar sueño
+                    foundSlot = searchSlots(true, null); // true = ignorar sueño
                     if (foundSlot) isEmergencyOverride = true;
                 }
             }
@@ -925,9 +995,9 @@
                 if (isEmergencyOverride) {
                     alert = "⚠️ Modo Emergencia: Se asignó en horario de sueño (22:00-08:00) porque la tarea es urgente y no hay otros cupos.";
                 }
-                return { start: foundSlot.start, end: foundSlot.end, duration: duration, limitUsed: limitOffset, alert: alert };
+                return { start: foundSlot.start, end: foundSlot.end, duration: duration, limitUsed: limitOffset, alert: alert, usedOptimalWindow: usedOptimalWindow, difficulty: difficultyKey };
             } else {
-                return { start: limitDate, end: new Date(limitDate.getTime() + duration * 60000), duration: duration, limitUsed: limitOffset, alert: "¡Urgente! No se encontraron huecos óptimos." };
+                return { start: limitDate, end: new Date(limitDate.getTime() + duration * 60000), duration: duration, limitUsed: limitOffset, alert: "¡Urgente! No se encontraron huecos óptimos.", usedOptimalWindow: false, difficulty: difficultyKey };
             }
         }
 
@@ -964,11 +1034,33 @@
             tempTaskData.recommendedStart = rec.start.toISOString();
             tempTaskData.recommendedEnd = rec.end.toISOString();
             tempTaskData.duration = rec.duration;
+            // NUEVO: guardamos si la recomendación respeta la ventana óptima,
+            // para poder mostrar el badge en las vistas de agenda y tabla.
+            tempTaskData.usedOptimalWindow = !!rec.usedOptimalWindow;
+            tempTaskData.optimalDifficulty = rec.difficulty;
             $('recDateText').innerText = rec.start.toLocaleString('es-ES', { weekday:'long', day:'numeric', month:'short', hour:'2-digit', minute:'2-digit' });
             let reason = `Tiempo límite: ${Math.round(rec.limitUsed/60)} horas.\nDuración: ${rec.duration} mins.\nFin: ${rec.end.toLocaleTimeString('es', {hour:'2-digit', minute:'2-digit'})}.`;
             $('recReasonText').innerText = reason;
             $('recAlert').style.display = rec.alert ? 'block' : 'none';
             if(rec.alert) $('recAlert').innerText = rec.alert;
+
+            // NUEVO: tarjeta de ventana óptima según la ciencia
+            const w = OPTIMAL_WINDOWS[rec.difficulty] || OPTIMAL_WINDOWS.baja;
+            const box = $('recOptimalBox');
+            if (rec.usedOptimalWindow) {
+                box.style.display = 'flex';
+                box.querySelector('i').className = 'fas fa-brain';
+                box.querySelector('i').style.color = 'var(--info)';
+                $('recOptimalTitle').innerText = `Horario óptimo (${rec.difficulty}) — según la ciencia`;
+                $('recOptimalDesc').innerText = `${w.label}. ${w.desc}`;
+            } else {
+                // No se logró ubicar dentro de la ventana óptima: fallback al sistema anterior.
+                box.style.display = 'flex';
+                box.querySelector('i').className = 'fas fa-exclamation-triangle';
+                box.querySelector('i').style.color = 'var(--warning)';
+                $('recOptimalTitle').innerText = `Ventana óptima no disponible (${rec.difficulty})`;
+                $('recOptimalDesc').innerText = `Lo ideal sería ${w.label}, pero tu agenda no dejó espacio. Se usó el sistema estándar de Thynka.`;
+            }
         }
 
         window.recalculate = () => performCalculation();
@@ -1096,6 +1188,14 @@
                                     <span class="detail-label">Dificultad</span>
                                     <span class="badge ${dClass}">${t.difficulty || 'media'}</span>
                                 </div>
+                                <div class="detail-item">
+                                    <span class="detail-label">Ventana</span>
+                                    ${t.usedOptimalWindow
+                                        ? `<span class="badge-optimal"><i class="fas fa-brain"></i> Óptima</span>`
+                                        : (t.optimalDifficulty && t.optimalDifficulty !== 'baja'
+                                            ? `<span class="badge-optimal fallback"><i class="fas fa-exclamation-triangle"></i> Estándar</span>`
+                                            : `<span class="badge badge-p3">Libre</span>`)}
+                                </div>
                             </div>
                         </div>
                         <div class="agenda-actions" onclick="event.stopPropagation()">
@@ -1118,7 +1218,7 @@
             // Table Render
             $('tableContainer').innerHTML = `<table class="data-table">
                 <thead><tr>
-                    <th>Tarea</th><th>Materia</th><th>Día Rec.</th><th>Inicio</th><th>Fin</th><th>Vencimiento</th><th>Prioridad</th><th>Acciones</th>
+                    <th>Tarea</th><th>Materia</th><th>Día Rec.</th><th>Inicio</th><th>Fin</th><th>Vencimiento</th><th>Prioridad</th><th>Ventana</th><th>Acciones</th>
                 </tr></thead>
                 <tbody>${
                 list.map(([id, t]) => {
@@ -1127,6 +1227,14 @@
                     const recDate = t.recommendedStart ? new Date(t.recommendedStart) : null;
                     const recEnd = t.recommendedEnd ? new Date(t.recommendedEnd) : null;
                     const diffDays = Math.ceil((dueDate - new Date()) / (1000 * 60 * 60 * 24));
+                    let windowCell;
+                    if (t.usedOptimalWindow) {
+                        windowCell = `<span class="badge-optimal"><i class="fas fa-brain"></i> Óptima</span>`;
+                    } else if (t.optimalDifficulty && t.optimalDifficulty !== 'baja') {
+                        windowCell = `<span class="badge-optimal fallback"><i class="fas fa-exclamation-triangle"></i> Estándar</span>`;
+                    } else {
+                        windowCell = `<span class="badge badge-p3">Libre</span>`;
+                    }
                     return `<tr>
                         <td><strong>${t.title}</strong></td>
                         <td style="color:${subj.color}; font-weight:600;">${subj.name}</td>
@@ -1135,6 +1243,7 @@
                         <td>${recEnd ? recEnd.toLocaleTimeString('es', {hour:'2-digit', minute:'2-digit'}) : '-'}</td>
                         <td style="font-weight:700; color:${diffDays <=2 ? 'var(--danger)' : 'inherit'}">${diffDays < 0 ? 'Vencida' : diffDays}</td>
                         <td><span class="badge badge-p${t.priority==='alta'?1:t.priority==='media'?2:3}">${t.priority}</span></td>
+                        <td>${windowCell}</td>
                         <td>
                             <button class="btn btn-sm btn-icon btn-success" onclick="startPomo('${id}')"><i class="fas fa-play"></i></button>
                             <button class="btn btn-sm btn-icon btn-warning" onclick="editTask('${id}')"><i class="fas fa-edit"></i></button>
